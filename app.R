@@ -234,6 +234,7 @@ plot_age_sex_pyramid_plus <- function(df, facet_by = c("zone","province"), bin =
 # -----------------------------------------------------------------------------
 ui <- page_fluid(
   theme = bs_theme(version = 5, bootswatch = "flatly"),
+  tags$head(tags$style(HTML(".summary-card-label {text-transform: uppercase; font-size: 0.75rem; letter-spacing: 0.05em; color: #6c757d;}\n.summary-card-value {font-size: 2rem; font-weight: 600;}\n.summary-card .card-body {display: flex; flex-direction: column; gap: 0.15rem;}"))),
   layout_sidebar(
     sidebar = sidebar(
       h4("MBUJI-MAYI BIOBANK AGE–SEX"),
@@ -257,12 +258,7 @@ ui <- page_fluid(
     ),
     card(
       card_header("Overzicht & Plotten"),
-      layout_column_wrap(
-        width = 1/3,
-        card(body = div(h5("Records"), textOutput("n_all"))),
-        card(body = div(h5("Met date_prelev"), textOutput("n_prelev"))),
-        card(body = div(h5("Unieke Barcodes"), textOutput("n_barcode")))
-      ),
+      uiOutput("summary_cards"),
       tabsetPanel(
         tabPanel("Zone-piramides", plotOutput("p_zone", height = 650)),
         tabPanel("Plus-grafiek", plotOutput("p_plus", height = 650)),
@@ -425,9 +421,34 @@ server <- function(input, output, session){
     df
   })
 
-  output$n_all     <- renderText({ df <- biobank();  if (is.null(df)) "0" else format(nrow(df), big.mark = " ") })
-  output$n_prelev  <- renderText({ df <- biobank();  if (is.null(df)) "0" else format(sum(!is.na(df$date_prelev)), big.mark = " ") })
-  output$n_barcode <- renderText({ df <- biobank(); if (is.null(df)) "0" else format(n_distinct(df$Barcode), big.mark = " ") })
+  output$summary_cards <- renderUI({
+    df <- filtered()
+    n_all <- if (is.null(df)) 0L else nrow(df)
+    n_prelev <- if (is.null(df)) 0L else sum(!is.na(df$date_prelev))
+    n_barcode <- if (is.null(df)) 0L else n_distinct(df$Barcode, na.rm = TRUE)
+
+    fmt <- function(x) {
+      formatC(as.integer(x), format = "d", big.mark = " ")
+    }
+
+    stats <- list(
+      list(label = "Records (selectie)", value = fmt(n_all)),
+      list(label = "Met date_prelev", value = fmt(n_prelev)),
+      list(label = "Unieke barcodes", value = fmt(n_barcode))
+    )
+
+    cards <- lapply(stats, function(x) {
+      card(
+        card_body(
+          class = "summary-card",
+          div(class = "summary-card-label", x$label),
+          div(class = "summary-card-value", x$value)
+        )
+      )
+    })
+
+    do.call(layout_column_wrap, c(list(width = 1/3), cards))
+  })
 
   output$p_zone <- renderPlot({
     df <- filtered(); validate(need(!is.null(df) && nrow(df) > 0, "Geen rijen binnen de selectie."))
