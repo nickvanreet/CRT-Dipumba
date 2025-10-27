@@ -107,6 +107,12 @@ clean_age_sex <- function(df){
     )
 }
 
+safe_days <- function(to, from, max_ok = 90) {
+  d <- as.numeric(difftime(to, from, units = "days"))
+  d[!is.finite(d) | d < 0 | d > max_ok] <- NA_real_
+  d
+}
+
 make_age_bands <- function(df, bin = 5){
   max_age <- ceiling(max(df$age_num, na.rm = TRUE)/bin) * bin
   df |>
@@ -262,6 +268,14 @@ ui <- page_fluid(
       tabsetPanel(
         tabPanel("Zone-piramides", plotOutput("p_zone", height = 650)),
         tabPanel("Plus-grafiek", plotOutput("p_plus", height = 650)),
+        tabPanel("Doorlooptijden",
+                 uiOutput("doorlooptijd_cards"),
+                 fluidRow(
+                   column(6, plotOutput("p_trans_time", height = 350)),
+                   column(6, plotOutput("p_trans_dist", height = 350))
+                 ),
+                 plotOutput("p_trans_box", height = 320)
+        ),
         tabPanel("Kaart (gezondheidszones)",
                  fluidRow(
                    column(4,
@@ -375,9 +389,9 @@ server <- function(input, output, session){
         LabID   = as.character(LabID)
       ) |>
       mutate(
-        transp_terrain = as.numeric(date_env_cpltha - date_prelev),
-        transp_cpltha  = as.numeric(date_rec_cpltha - date_env_cpltha),
-        transp_inrb    = as.numeric(date_env_inrb   - date_rec_cpltha)
+        transp_terrain = safe_days(date_env_cpltha, date_prelev, max_ok = 30),
+        transp_cpltha  = safe_days(date_rec_cpltha, date_env_cpltha, max_ok = 30),
+        transp_inrb    = safe_days(date_env_inrb, date_rec_cpltha, max_ok = 90)
       ) |>
       distinct(Barcode, LabID, .keep_all = TRUE) |>
       clean_age_sex()
@@ -421,6 +435,47 @@ server <- function(input, output, session){
     df
   })
 
+  transport_long <- reactive({
+    df <- filtered(); if (is.null(df) || !nrow(df)) return(NULL)
+
+    has_field_temp <- "temp_field" %in% names(df)
+    has_cpltha_temp <- "temp_cpltha" %in% names(df)
+
+    df |> 
+      transmute(
+        sample_date = date_prelev,
+        `Field → HS` = transp_terrain,
+        `HS → LSD`  = transp_cpltha,
+        `LSD → INRB` = transp_inrb,
+        temp_field = if (has_field_temp) temp_field else NA_character_,
+        temp_cpltha = if (has_cpltha_temp) temp_cpltha else NA_character_
+      ) |>
+      tidyr::pivot_longer(
+        cols = c(`Field → HS`, `HS → LSD`, `LSD → INRB`),
+        names_to = "segment",
+        values_to = "days",
+        values_drop_na = TRUE
+      ) |>
+      mutate(
+        temp_code_raw = case_when(
+          segment == "Field → HS" ~ temp_field,
+          segment == "HS → LSD"  ~ temp_cpltha,
+          TRUE ~ NA_character_
+        ),
+        temp_code_raw = toupper(trimws(temp_code_raw)),
+        temp_code = dplyr::case_when(
+          temp_code_raw %in% c("A", "AMB", "AMBANTE", "AMBIANTE", "AMBIENT", "AMBIA") ~ "Ambiante",
+          temp_code_raw %in% c("F", "FR", "FRIGO", "FRIG") ~ "Frigo",
+          temp_code_raw %in% c("C", "CONG", "CONGE", "CONGELATEUR", "FREEZER") ~ "Congélateur",
+          is.na(temp_code_raw) | temp_code_raw == "" ~ "Onbekend",
+          TRUE ~ temp_code_raw
+        ),
+        segment = factor(segment, levels = c("Field → HS", "HS → LSD", "LSD → INRB")),
+        temp_code = factor(temp_code, levels = c("Ambiante", "Frigo", "Congélateur", "Onbekend")),
+        week = lubridate::floor_date(sample_date, "week")
+      )
+  })
+
   output$summary_cards <- renderUI({
     df <- filtered()
     n_all <- if (is.null(df)) 0L else nrow(df)
@@ -458,6 +513,94 @@ server <- function(input, output, session){
   output$p_plus <- renderPlot({
     df <- filtered(); validate(need(!is.null(df) && nrow(df) > 0, "Geen rijen binnen de selectie."))
     plot_age_sex_pyramid_plus(df, facet_by = input$facet, bin = input$bin, split_study = input$split_study)
+  })
+
+  output$doorlooptijd_cards <- renderUI({
+    dat <- transport_long();
+    if (is.null(dat) || !nrow(dat)) {
+      return(helpText("Geen doorlooptijdgegevens binnen de huidige selectie."))
+    }
+
+    summ <- dat |>
+      group_by(segment) |>
+      summarise(
+        n = dplyr::n(),
+        median = stats::median(days, na.rm = TRUE),
+        p95 = stats::quantile(days, 0.95, na.rm = TRUE, names = FALSE),
+        .groups = "drop"
+      )
+
+    fmt_days <- function(x) {
+      ifelse(is.na(x) | !is.finite(x), "–", scales::number(x, accuracy = 0.1, suffix = " d"))
+    }
+    fmt_int <- function(x) formatC(as.integer(x), format = "d", big.mark = " ")
+
+    cards <- purrr::pmap(summ, function(segment, n, median, p95) {
+      card(
+        card_body(
+          class = "summary-card",
+          div(class = "summary-card-label", segment),
+          div(class = "summary-card-value", fmt_days(median)),
+          tags$small(sprintf("95e percentiel: %s · N = %s", fmt_days(p95), fmt_int(n)))
+        )
+      )
+    })
+
+    do.call(layout_column_wrap, c(list(width = 1/3), cards))
+  })
+
+  output$p_trans_time <- renderPlot({
+    dat <- transport_long();
+    validate(need(!is.null(dat) && nrow(dat) > 0, "Geen doorlooptijdgegevens."))
+
+    weekly <- dat |>
+      filter(!is.na(week)) |>
+      group_by(segment, week) |>
+      summarise(mean_days = mean(days, na.rm = TRUE), .groups = "drop")
+
+    seg_cols <- setNames(c("#1b9e77", "#d95f02", "#7570b3"), levels(dat$segment))
+
+    ggplot(weekly, aes(week, mean_days, colour = segment)) +
+      geom_line(linewidth = 1) +
+      geom_point(size = 2) +
+      scale_colour_manual(values = seg_cols, name = "Segment") +
+      scale_x_date(date_labels = "%d %b", date_breaks = "2 weeks") +
+      labs(x = NULL, y = "Gemiddelde dagen", title = "Gemiddelde doorlooptijd per week") +
+      theme_minimal(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+
+  output$p_trans_dist <- renderPlot({
+    dat <- transport_long();
+    validate(need(!is.null(dat) && nrow(dat) > 0, "Geen doorlooptijdgegevens."))
+
+    seg_cols <- setNames(c("#1b9e77", "#d95f02", "#7570b3"), levels(dat$segment))
+
+    ggplot(dat, aes(sample_date, days, colour = segment)) +
+      geom_point(alpha = 0.55, size = 1.8) +
+      facet_wrap(~segment, ncol = 1, scales = "free_y") +
+      scale_colour_manual(values = seg_cols, guide = "none") +
+      scale_x_date(date_labels = "%d %b", date_breaks = "2 weeks") +
+      labs(x = NULL, y = "Dagen", title = "Doorlooptijd per staal over de tijd") +
+      theme_minimal(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+
+  output$p_trans_box <- renderPlot({
+    dat <- transport_long();
+    validate(need(!is.null(dat) && nrow(dat) > 0, "Geen doorlooptijdgegevens."))
+
+    seg_cols <- setNames(c("#1b9e77", "#d95f02", "#7570b3"), levels(dat$segment))
+    shape_map <- c("Ambiante" = 21, "Frigo" = 24, "Congélateur" = 22, "Onbekend" = 16)
+
+    ggplot(dat, aes(segment, days, fill = segment)) +
+      geom_boxplot(width = 0.6, alpha = 0.85, colour = "grey30", outlier.shape = NA) +
+      geom_jitter(aes(shape = temp_code), width = 0.1, height = 0, size = 2, alpha = 0.6) +
+      scale_fill_manual(values = seg_cols, guide = "none") +
+      scale_shape_manual(values = shape_map, name = "Temperatuur") +
+      labs(x = NULL, y = "Dagen", title = "Verdeling per segment", subtitle = "Punten tonen temperatuurcategorie") +
+      theme_minimal(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 15, hjust = 1))
   })
 
   output$tbl <- renderDT({
