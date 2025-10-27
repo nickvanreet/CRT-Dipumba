@@ -48,21 +48,20 @@ jobs:
               echo "$v present (length ${#v})"
             fi
           done
-
-      - name: Install R deps
+          
+      - name: Install R deps for manifest
         run: |
-          Rscript -e 'install.packages(c("pak","rsconnect"), repos="https://cloud.r-project.org")'
-          Rscript -e 'pak::pak(c("shiny","rsconnect"))'
+          Rscript -e 'install.packages("pak", repos="https://cloud.r-project.org")'
+          Rscript -e 'pak::pak(c(
+            "shiny","tidyverse","readxl","janitor","lubridate","DT",
+            "sf","leaflet","stringi","bslib","glue"
+          ))'
 
-      - name: Check rsconnect auth
+      - name: Write rsconnect manifest
         run: |
           Rscript -e '
-            library(rsconnect)
-            acc <- Sys.getenv("SHINYAPPS_ACCOUNT")
-            tok <- Sys.getenv("SHINYAPPS_TOKEN")
-            sec <- Sys.getenv("SHINYAPPS_SECRET")
-            setAccountInfo(name = acc, token = tok, secret = sec, server = "shinyapps.io")
-            print(accounts())
+            dir <- Sys.getenv("SHINYAPPS_DIR"); if(dir=="") dir <- ".";
+            rsconnect::writeManifest(appDir = dir)
           '
 
       - name: Deploy to shinyapps.io
@@ -72,11 +71,17 @@ jobs:
             acc <- Sys.getenv("SHINYAPPS_ACCOUNT")
             app <- Sys.getenv("SHINYAPPS_APPNAME")
             dir <- Sys.getenv("SHINYAPPS_DIR"); if(dir=="") dir <- "."
+            setAccountInfo(
+              name   = acc,
+              token  = trimws(Sys.getenv("SHINYAPPS_TOKEN")),
+              secret = trimws(Sys.getenv("SHINYAPPS_SECRET")),
+              server = "shinyapps.io"
+            )
             rsconnect::deployApp(
               appDir = dir,
               appName = app,
               account = acc,
-              server = "shinyapps.io",
+              server  = "shinyapps.io",
               forceUpdate = TRUE
             )
           '
