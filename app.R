@@ -129,16 +129,6 @@ read_extractions_dir <- function(dir_extraction){
   }
 
   purrr::map_dfr(files, read_one) |>
-    {
-      # Carry forward the raw volume column without relying on cur_data_all()
-      dat <- .
-      if ("volume_total_echantillon_sang_drs_ml" %in% names(dat)) {
-        dat$volume_raw <- dat[["volume_total_echantillon_sang_drs_ml"]]
-      } else {
-        dat$volume_raw <- NA_character_
-      }
-      dat
-    } |>
     mutate(
       volume_ml = suppressWarnings(as.numeric(volume_raw)),
       volume_ml = ifelse(!is.na(volume_ml) & volume_ml > 10, volume_ml / 10, volume_ml)
