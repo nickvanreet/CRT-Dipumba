@@ -1215,15 +1215,25 @@ server <- function(input, output, session){
       summarise(mean_days = mean(days, na.rm = TRUE), .groups = "drop")
 
     seg_cols <- setNames(c("#1b9e77", "#d95f02", "#7570b3"), levels(dat$segment))
+    bg_rect <- tibble(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf)
 
     ggplot(weekly, aes(week, mean_days, colour = segment)) +
+      geom_rect(data = bg_rect,
+                aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+                inherit.aes = FALSE,
+                fill = scales::alpha("#E8F6F3", 0.35),
+                colour = NA) +
       geom_line(linewidth = 1) +
       geom_point(size = 2) +
       scale_colour_manual(values = seg_cols, name = "Segment") +
       scale_x_date(date_labels = "%d %b", date_breaks = "2 weeks") +
       labs(x = NULL, y = "Gemiddelde dagen", title = "Gemiddelde doorlooptijd per week") +
       theme_minimal(base_size = 12) +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.background = element_rect(fill = scales::alpha("#E8F6F3", 0.35), colour = NA),
+        plot.background = element_rect(fill = "#FDFEFE", colour = NA)
+      )
   })
 
   output$p_trans_dist <- renderPlot({
@@ -1231,15 +1241,33 @@ server <- function(input, output, session){
     validate(need(!is.null(dat) && nrow(dat) > 0, "Geen doorlooptijdgegevens."))
 
     seg_cols <- setNames(c("#1b9e77", "#d95f02", "#7570b3"), levels(dat$segment))
+    bg_df <- tibble(
+      segment = factor(levels(dat$segment), levels = levels(dat$segment)),
+      xmin = -Inf,
+      xmax = Inf,
+      ymin = -Inf,
+      ymax = Inf,
+      fill = scales::alpha(seg_cols[as.character(segment)], 0.25)
+    )
 
     ggplot(dat, aes(sample_date, days, colour = segment)) +
+      geom_rect(
+        data = bg_df,
+        mapping = aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill),
+        inherit.aes = FALSE,
+        colour = NA
+      ) +
+      scale_fill_identity(guide = "none") +
       geom_point(alpha = 0.55, size = 1.8) +
       facet_wrap(~segment, ncol = 1, scales = "free_y") +
       scale_colour_manual(values = seg_cols, guide = "none") +
       scale_x_date(date_labels = "%d %b", date_breaks = "2 weeks") +
       labs(x = NULL, y = "Dagen", title = "Doorlooptijd per staal over de tijd") +
       theme_minimal(base_size = 12) +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.background = element_rect(fill = "#F4F6F7", colour = NA)
+      )
   })
 
   output$p_trans_box <- renderPlot({
@@ -1248,15 +1276,27 @@ server <- function(input, output, session){
 
     seg_cols <- setNames(c("#1b9e77", "#d95f02", "#7570b3"), levels(dat$segment))
     shape_map <- c("Ambiante" = 21, "Frigo" = 24, "Congélateur" = 22, "Onbekend" = 16)
+    bg_rect <- tibble(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf)
 
     ggplot(dat, aes(segment, days, fill = segment)) +
+      geom_rect(
+        data = bg_rect,
+        aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+        inherit.aes = FALSE,
+        fill = scales::alpha("#FDF2E9", 0.4),
+        colour = NA
+      ) +
       geom_boxplot(width = 0.6, alpha = 0.85, colour = "grey30", outlier.shape = NA) +
       geom_jitter(aes(shape = temp_code), width = 0.1, height = 0, size = 2, alpha = 0.6) +
       scale_fill_manual(values = seg_cols, guide = "none") +
       scale_shape_manual(values = shape_map, name = "Temperatuur") +
       labs(x = NULL, y = "Dagen", title = "Verdeling per segment", subtitle = "Punten tonen temperatuurcategorie") +
       theme_minimal(base_size = 12) +
-      theme(axis.text.x = element_text(angle = 15, hjust = 1))
+      theme(
+        axis.text.x = element_text(angle = 15, hjust = 1),
+        panel.background = element_rect(fill = scales::alpha("#FDF2E9", 0.4), colour = NA),
+        plot.background = element_rect(fill = "#FEF9F4", colour = NA)
+      )
   })
 
   output$p_trans_flag <- renderPlot({
