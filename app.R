@@ -1391,8 +1391,8 @@ server <- function(input, output, session){
     metric_title <- ifelse(is.na(metric_title), "", metric_title)
     border_cols <- if (isTRUE(input$outline_by_prov)) prov_outline_color(gj$prov_key) else "#444444"
 
-    leaflet(gj) |>|
-      addProviderTiles(providers$CartoDB.Positron) |>|
+    leaflet(gj) |>
+      addProviderTiles(providers$CartoDB.Positron) |>
       addPolygons(
         weight = 1.2, color = border_cols, opacity = 1,
         fillOpacity = 0.85, fillColor = ~pal(metric),
@@ -1408,7 +1408,7 @@ server <- function(input, output, session){
           htmltools::HTML
         ),
         highlightOptions = highlightOptions(weight = 2, color = "#000000", bringToFront = TRUE)
-      ) |>|
+      ) |>
       addLegend(pal = pal, values = metric, title = metric_title, opacity = 0.9)
   })
 
@@ -1420,7 +1420,7 @@ server <- function(input, output, session){
     focus <- gj |> dplyr::filter(prov_key %in% c("kasai oriental", "lomami"))
     req(nrow(focus) > 0)
     bbox <- sf::st_bbox(focus)
-    leafletProxy("map_zones") |>|
+    leafletProxy("map_zones") |>
       fitBounds(lng1 = bbox['xmin'], lat1 = bbox['ymin'], lng2 = bbox['xmax'], lat2 = bbox['ymax'])
   })
 
