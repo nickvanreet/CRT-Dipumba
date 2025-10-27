@@ -1511,6 +1511,5 @@ server <- function(input, output, session){
   )
 }
 
-enableBookmarking("url")
 
 shinyApp(ui, server)
