@@ -1,4 +1,4 @@
-////# app.R — MBUJI-MAYI BIOBANK AGE–SEX (Shiny)
+# app.R — MBUJI-MAYI BIOBANK AGE–SEX (Shiny)
 # -----------------------------------------------------------------------------
 # New: bestandskeuze + diagnose-tab om snel te zien waarom plots leeg zijn.
 # -----------------------------------------------------------------------------
