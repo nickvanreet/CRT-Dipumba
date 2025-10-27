@@ -54,7 +54,7 @@ jobs:
           Rscript -e 'install.packages("pak", repos="https://cloud.r-project.org")'
           Rscript -e 'pak::pak(c(
             "shiny","tidyverse","readxl","janitor","lubridate","DT",
-            "sf","leaflet","stringi","bslib","glue"
+            "sf","leaflet","stringi","bslib","glue","rsconnect"
           ))'
 
       - name: Write rsconnect manifest
