@@ -3,13 +3,18 @@ name: Deploy Shiny (shinyapps.io)
 on:
   push:
     branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    needs: [ ]
     env:
       GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+      SHINYAPPS_ACCOUNT: ${{ secrets.SHINYAPPS_ACCOUNT }}
+      SHINYAPPS_TOKEN:   ${{ secrets.SHINYAPPS_TOKEN }}
+      SHINYAPPS_SECRET:  ${{ secrets.SHINYAPPS_SECRET }}
+      SHINYAPPS_APPNAME: ${{ secrets.SHINYAPPS_APPNAME }}
+      SHINYAPPS_DIR:     ${{ secrets.SHINYAPPS_DIR }}
 
     steps:
       - uses: actions/checkout@v4
@@ -31,18 +36,46 @@ jobs:
             libfreetype6-dev libpng-dev libtiff5-dev libjpeg-dev \
             libudunits2-dev libgdal-dev libgeos-dev libproj-dev gdal-bin
 
-      - name: R deps
+      - name: Preflight secrets
+        shell: bash
+        run: |
+          for v in SHINYAPPS_ACCOUNT SHINYAPPS_TOKEN SHINYAPPS_SECRET; do
+            if [ -z "${!v}" ]; then
+              echo "::error title=Missing secret::$v is empty or undefined"
+              exit 1
+            else
+              echo "$v present (length ${#v})"
+            fi
+          done
+
+      - name: Install R deps
         run: |
           Rscript -e 'install.packages(c("pak","rsconnect"), repos="https://cloud.r-project.org")'
-          Rscript -e 'pak::pak(c("shiny","tidyverse","readxl","janitor","lubridate","DT","sf","leaflet","stringi"))'
+          Rscript -e 'pak::pak(c("shiny","rsconnect"))'
+
+      - name: Check rsconnect auth
+        run: |
+          Rscript -e '
+            library(rsconnect)
+            acc <- Sys.getenv("SHINYAPPS_ACCOUNT")
+            tok <- Sys.getenv("SHINYAPPS_TOKEN")
+            sec <- Sys.getenv("SHINYAPPS_SECRET")
+            setAccountInfo(name = acc, token = tok, secret = sec, server = "shinyapps.io")
+            print(accounts())
+          '
 
       - name: Deploy to shinyapps.io
-        env:
-          SHINYAPPS_ACCOUNT: ${{ secrets.SHINYAPPS_ACCOUNT }}
-          SHINYAPPS_TOKEN:   ${{ secrets.SHINYAPPS_TOKEN }}
-          SHINYAPPS_SECRET:  ${{ secrets.SHINYAPPS_SECRET }}
-          SHINYAPPS_APPNAME: ${{ secrets.SHINYAPPS_APPNAME }} # bv. "crt-dipumba"
-          SHINYAPPS_DIR:     ${{ secrets.SHINYAPPS_DIR }}     # optioneel; default: repo root
         run: |
-          Rscript -e 'library(rsconnect); setAccountInfo(name=Sys.getenv("SHINYAPPS_ACCOUNT"), token=Sys.getenv("SHINYAPPS_TOKEN"), secret=Sys.getenv("SHINYAPPS_SECRET"))'
-          Rscript -e 'dir <- Sys.getenv("SHINYAPPS_DIR"); if(dir=="") dir="."; rsconnect::deployApp(appDir=dir, appName=Sys.getenv("SHINYAPPS_APPNAME"), forceUpdate=TRUE)'
+          Rscript -e '
+            library(rsconnect)
+            acc <- Sys.getenv("SHINYAPPS_ACCOUNT")
+            app <- Sys.getenv("SHINYAPPS_APPNAME")
+            dir <- Sys.getenv("SHINYAPPS_DIR"); if(dir=="") dir <- "."
+            rsconnect::deployApp(
+              appDir = dir,
+              appName = app,
+              account = acc,
+              server = "shinyapps.io",
+              forceUpdate = TRUE
+            )
+          '
