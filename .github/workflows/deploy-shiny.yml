@@ -8,7 +8,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: CRT-Dipumba
+    environment: SHINYAPPS_ACCOUNT
     env:
       GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
       SHINYAPPS_ACCOUNT: ${{ secrets.SHINYAPPS_ACCOUNT }}
