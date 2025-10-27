@@ -1,0 +1,48 @@
+name: Deploy Shiny (shinyapps.io)
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [ ]
+    env:
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: 'release'
+          use-public-rspm: true
+
+      - uses: r-lib/actions/setup-pandoc@v2
+
+      - name: System libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libcurl4-openssl-dev libssl-dev libxml2-dev pkg-config \
+            libicu-dev \
+            libfontconfig1-dev libharfbuzz-dev libfribidi-dev \
+            libfreetype6-dev libpng-dev libtiff5-dev libjpeg-dev \
+            libudunits2-dev libgdal-dev libgeos-dev libproj-dev gdal-bin
+
+      - name: R deps
+        run: |
+          Rscript -e 'install.packages(c("pak","rsconnect"), repos="https://cloud.r-project.org")'
+          Rscript -e 'pak::pak(c("shiny","tidyverse","readxl","janitor","lubridate","DT","sf","leaflet","stringi"))'
+
+      - name: Deploy to shinyapps.io
+        env:
+          SHINYAPPS_ACCOUNT: ${{ secrets.SHINYAPPS_ACCOUNT }}
+          SHINYAPPS_TOKEN:   ${{ secrets.SHINYAPPS_TOKEN }}
+          SHINYAPPS_SECRET:  ${{ secrets.SHINYAPPS_SECRET }}
+          SHINYAPPS_APPNAME: ${{ secrets.SHINYAPPS_APPNAME }} # bv. "crt-dipumba"
+          SHINYAPPS_DIR:     ${{ secrets.SHINYAPPS_DIR }}     # optioneel; default: repo root
+        run: |
+          Rscript -e 'library(rsconnect); setAccountInfo(name=Sys.getenv("SHINYAPPS_ACCOUNT"), token=Sys.getenv("SHINYAPPS_TOKEN"), secret=Sys.getenv("SHINYAPPS_SECRET"))'
+          Rscript -e 'dir <- Sys.getenv("SHINYAPPS_DIR"); if(dir=="") dir="."; rsconnect::deployApp(appDir=dir, appName=Sys.getenv("SHINYAPPS_APPNAME"), forceUpdate=TRUE)'
