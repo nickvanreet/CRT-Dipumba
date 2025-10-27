@@ -1,0 +1,47 @@
+name: R Project CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+      RENV_CONFIG_WIDGETS_ENABLED: FALSE
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: 'release'
+          use-public-rspm: true
+
+      - uses: r-lib/actions/setup-pandoc@v2
+
+      # Herstel deps via renv als er een lockfile is
+      - name: Restore deps with renv (if present)
+        if: ${{ hashFiles('renv.lock') != '' }}
+        uses: r-lib/actions/setup-renv@v2
+
+      # Anders: val terug op pak en installeer wat je nodig hebt
+      - name: Install deps with pak (fallback)
+        if: ${{ hashFiles('renv.lock') == '' }}
+        run: |
+          Rscript -e 'install.packages("pak", repos="https://cloud.r-project.org")'
+          # voeg hieronder je hoofddeps toe indien nodig
+          Rscript -e 'pak::pak(c("shiny","tidyverse","readxl","janitor","lubridate","DT","sf","leaflet","stringi"))'
+
+      # Lint of rooktest: kan je aanpassen naar jouw scripts
+      - name: Lint (optional)
+        run: |
+          Rscript -e 'if (!requireNamespace("lintr", quietly=TRUE)) install.packages("lintr"); lintr::lint_dir()'
+
+      # Rooktest: start R en laad je hoofdscript/app
+      - name: Smoke test
+        run: |
+          Rscript -e 'source("app.R"); message("Loaded app.R ok.")' || true
+          # of voer je scripts:
+          # Rscript scripts/build.R
