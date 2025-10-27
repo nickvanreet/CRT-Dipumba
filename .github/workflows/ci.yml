@@ -21,7 +21,6 @@ jobs:
 
       - uses: r-lib/actions/setup-pandoc@v2
 
-      # 1) SYSTEEM-DEPS EERST (voor pak / curl / sf / stringi)
       - name: Install system libraries
         run: |
           sudo apt-get update
@@ -32,25 +31,38 @@ jobs:
             libfreetype6-dev libpng-dev libtiff5-dev libjpeg-dev \
             libudunits2-dev libgdal-dev libgeos-dev libproj-dev gdal-bin
 
-      # 2) Dependencies herstellen
-      # Gebruik renv als je een renv.lock hebt
+      # Gebruik renv als aanwezig, anders pak
       - name: Restore deps with renv (if present)
         if: ${{ hashFiles('renv.lock') != '' }}
         uses: r-lib/actions/setup-renv@v2
 
-      # Anders: val terug op pak (nu mét curl headers aanwezig)
       - name: Install deps with pak (fallback)
         if: ${{ hashFiles('renv.lock') == '' }}
         run: |
           Rscript -e 'install.packages("pak", repos="https://cloud.r-project.org")'
-          Rscript -e 'pak::pak(c("shiny","tidyverse","readxl","janitor","lubridate","DT","sf","leaflet","stringi"))'
+          Rscript -e 'pak::pak(c("shiny","tidyverse","readxl","janitor","lubridate","DT","sf","leaflet","stringi","testthat","lintr"))'
 
-      # Optioneel: lint
       - name: Lint (optional)
         run: |
-          Rscript -e 'if (!requireNamespace("lintr", quietly=TRUE)) install.packages("lintr"); lintr::lint_dir()'
+          Rscript -e 'if (!requireNamespace("lintr", quietly=TRUE)) install.packages("lintr"); lintr::lint_dir()' || true
 
-      # 3) Rooktest van je project (geen DESCRIPTION nodig)
-      - name: Smoke test
+      - name: Unit tests (if tests/ exists)
         run: |
-          test -f app.R && Rscript -e 'source("app.R"); message("Loaded app.R ok.")' || echo "No app.R, skipping"
+          if [ -d "tests" ]; then Rscript -e 'if (!requireNamespace("testthat", quietly=TRUE)) install.packages("testthat"); testthat::test_dir("tests", reporter="summary")'; fi
+
+      - name: Smoke test app.R (if present)
+        run: |
+          if [ -f "app.R" ]; then Rscript -e 'source("app.R"); message("Loaded app.R ok.")'; else echo "No app.R, skipping"; fi
+
+      # Verzamel nuttige artifacts (logs, png, html, etc.)
+      - name: Collect outputs (optional)
+        run: |
+          mkdir -p check
+          find . -maxdepth 2 -type f \( -name "*.html" -o -name "*.pdf" -o -name "*.png" -o -name "*.csv" -o -name "*.xlsx" -o -name "*.rds" \) -print -exec cp {} check/ \; || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs
+          path: check
+          if-no-files-found: ignore
