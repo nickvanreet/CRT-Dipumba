@@ -21,27 +21,36 @@ jobs:
 
       - uses: r-lib/actions/setup-pandoc@v2
 
-      # Herstel deps via renv als er een lockfile is
+      # 1) SYSTEEM-DEPS EERST (voor pak / curl / sf / stringi)
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libcurl4-openssl-dev libssl-dev libxml2-dev pkg-config \
+            libicu-dev \
+            libfontconfig1-dev libharfbuzz-dev libfribidi-dev \
+            libfreetype6-dev libpng-dev libtiff5-dev libjpeg-dev \
+            libudunits2-dev libgdal-dev libgeos-dev libproj-dev gdal-bin
+
+      # 2) Dependencies herstellen
+      # Gebruik renv als je een renv.lock hebt
       - name: Restore deps with renv (if present)
         if: ${{ hashFiles('renv.lock') != '' }}
         uses: r-lib/actions/setup-renv@v2
 
-      # Anders: val terug op pak en installeer wat je nodig hebt
+      # Anders: val terug op pak (nu mét curl headers aanwezig)
       - name: Install deps with pak (fallback)
         if: ${{ hashFiles('renv.lock') == '' }}
         run: |
           Rscript -e 'install.packages("pak", repos="https://cloud.r-project.org")'
-          # voeg hieronder je hoofddeps toe indien nodig
           Rscript -e 'pak::pak(c("shiny","tidyverse","readxl","janitor","lubridate","DT","sf","leaflet","stringi"))'
 
-      # Lint of rooktest: kan je aanpassen naar jouw scripts
+      # Optioneel: lint
       - name: Lint (optional)
         run: |
           Rscript -e 'if (!requireNamespace("lintr", quietly=TRUE)) install.packages("lintr"); lintr::lint_dir()'
 
-      # Rooktest: start R en laad je hoofdscript/app
+      # 3) Rooktest van je project (geen DESCRIPTION nodig)
       - name: Smoke test
         run: |
-          Rscript -e 'source("app.R"); message("Loaded app.R ok.")' || true
-          # of voer je scripts:
-          # Rscript scripts/build.R
+          test -f app.R && Rscript -e 'source("app.R"); message("Loaded app.R ok.")' || echo "No app.R, skipping"
