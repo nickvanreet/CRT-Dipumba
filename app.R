@@ -127,8 +127,8 @@ read_extractions_dir <- function(dir_extraction){
 
   purrr::map_dfr(files, read_one) |>
     mutate(
-      volume_raw = if ("volume_total_echantillon_sang_drs_ml" %in% names(.))
-        volume_total_echantillon_sang_drs_ml else NA_character_,
+      volume_raw = if ("volume_total_echantillon_sang_drs_ml" %in% names(cur_data_all()))
+        .data[["volume_total_echantillon_sang_drs_ml"]] else NA_character_,
       volume_ml = suppressWarnings(as.numeric(volume_raw)),
       volume_ml = ifelse(!is.na(volume_ml) & volume_ml > 10, volume_ml / 10, volume_ml)
     )
