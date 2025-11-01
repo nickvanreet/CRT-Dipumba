@@ -289,7 +289,55 @@ make_age_bands <- function(df, bin = 5){
 }
 
 # GRID3 helpers ---------------------------------------------------------------
-read_grid3_health_zones_impl <- function(fields = c("province", "zonesante", "zs_uid")){
+read_grid3_health_zones_impl <- function(
+    fields = c("province", "zonesante", "zs_uid"),
+    local_paths = NULL
+){
+  normalise_fields <- function(sf_obj) {
+    nms <- names(sf_obj)
+    if (!"province"  %in% nms) names(sf_obj)[match(tolower(nms), "province")]  <- "province"
+    if (!"zonesante" %in% nms) names(sf_obj)[match(tolower(nms), "zonesante")] <- "zonesante"
+    if (!"zs_uid"    %in% nms && "zsuid" %in% tolower(nms)) {
+      names(sf_obj)[match(tolower(nms), "zsuid")] <- "zs_uid"
+    }
+    sf_obj
+  }
+
+  read_local_candidate <- function(path) {
+    if (!nzchar(path) || !file.exists(path)) {
+      return(NULL)
+    }
+
+    # allow zipped shapefiles by using the "zip://" prefix automatically
+    fmt <- tools::file_ext(path)
+    to_read <- if (tolower(fmt) == "zip") paste0("zip://", normalizePath(path)) else path
+
+    sf_obj <- try(sf::read_sf(to_read, quiet = TRUE), silent = TRUE)
+    if (inherits(sf_obj, "try-error") || !nrow(sf_obj)) {
+      return(NULL)
+    }
+
+    sf_obj <- normalise_fields(sf_obj)
+    keep <- unique(c(fields, attr(sf_obj, "sf_column")))
+    suppressWarnings(sf_obj[, intersect(keep, names(sf_obj)), drop = FALSE])
+  }
+
+  local_defaults <- c(
+    Sys.getenv("GRID3_HEALTH_ZONES_FILE", unset = ""),
+    local_paths,
+    file.path("data", "grid3_health_zones.gpkg"),
+    file.path("data", "grid3_health_zones.geojson"),
+    file.path("www", "grid3_health_zones.geojson"),
+    file.path("www", "grid3_health_zones.gpkg")
+  )
+
+  for (candidate in unique(local_defaults)) {
+    sf_obj <- read_local_candidate(candidate)
+    if (!is.null(sf_obj)) {
+      return(sf_obj)
+    }
+  }
+
   bases <- c(
     "https://services3.arcgis.com/BU6Aadhn6tbBEdyk/arcgis/rest/services/GRID3_COD_health_zones_v7_0/FeatureServer/0/query",
     "https://services3.arcgis.com/BU6Aadhn6tbBEdyk/arcgis/rest/services/GRID3_COD_health_zones_v6_0/FeatureServer/0/query",
@@ -304,17 +352,12 @@ read_grid3_health_zones_impl <- function(fields = c("province", "zonesante", "zs
   errs <- list()
   for (b in bases) {
     url <- q(b, fields)
-    sf <- try(sf::read_sf(url, quiet = TRUE), silent = TRUE)
-    if (!inherits(sf, "try-error") && nrow(sf) > 0) {
-      nms <- names(sf)
-      if (!"province"  %in% nms) names(sf)[match(tolower(nms), "province")]  <- "province"
-      if (!"zonesante" %in% nms) names(sf)[match(tolower(nms), "zonesante")] <- "zonesante"
-      if (!"zs_uid"    %in% nms && "zsuid" %in% tolower(nms)) {
-        names(sf)[match(tolower(nms), "zsuid")] <- "zs_uid"
-      }
-      return(sf)
+    sf_obj <- try(sf::read_sf(url, quiet = TRUE), silent = TRUE)
+    if (!inherits(sf_obj, "try-error") && nrow(sf_obj) > 0) {
+      sf_obj <- normalise_fields(sf_obj)
+      return(sf_obj)
     }
-    errs[[b]] <- if (inherits(sf, "try-error")) as.character(sf) else "no rows"
+    errs[[b]] <- if (inherits(sf_obj, "try-error")) as.character(sf_obj) else "no rows"
   }
   stop("Could not fetch GRID3 health zones from public endpoints.\n",
        "Some services now require an access token.\n",
