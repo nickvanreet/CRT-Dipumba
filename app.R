@@ -308,12 +308,30 @@ read_grid3_health_zones_impl <- function(
       return(NULL)
     }
 
-    # allow zipped shapefiles by using the "zip://" prefix automatically
-    fmt <- tools::file_ext(path)
-    to_read <- if (tolower(fmt) == "zip") paste0("zip://", normalizePath(path)) else path
+    fmt <- tolower(tools::file_ext(path))
 
-    sf_obj <- try(sf::read_sf(to_read, quiet = TRUE), silent = TRUE)
-    if (inherits(sf_obj, "try-error") || !nrow(sf_obj)) {
+    sf_obj <- switch(
+      fmt,
+      rds = try(readRDS(path), silent = TRUE),
+      {
+        # allow zipped shapefiles by using the "zip://" prefix automatically
+        to_read <- if (fmt == "zip") paste0("zip://", normalizePath(path)) else path
+        try(sf::read_sf(to_read, quiet = TRUE), silent = TRUE)
+      }
+    )
+
+    if (inherits(sf_obj, "try-error") || is.null(sf_obj)) {
+      return(NULL)
+    }
+
+    if (!inherits(sf_obj, "sf")) {
+      sf_obj <- try(sf::st_as_sf(sf_obj), silent = TRUE)
+      if (inherits(sf_obj, "try-error") || is.null(sf_obj)) {
+        return(NULL)
+      }
+    }
+
+    if (!nrow(sf_obj)) {
       return(NULL)
     }
 
@@ -325,10 +343,12 @@ read_grid3_health_zones_impl <- function(
   local_defaults <- c(
     Sys.getenv("GRID3_HEALTH_ZONES_FILE", unset = ""),
     local_paths,
+    file.path("data", "grid3_health_zones.rds"),
     file.path("data", "grid3_health_zones.gpkg"),
     file.path("data", "grid3_health_zones.geojson"),
     file.path("www", "grid3_health_zones.geojson"),
-    file.path("www", "grid3_health_zones.gpkg")
+    file.path("www", "grid3_health_zones.gpkg"),
+    file.path("www", "grid3_health_zones.rds")
   )
 
   for (candidate in unique(local_defaults)) {
