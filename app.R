@@ -258,9 +258,17 @@ safe_days <- function(to, from, max_ok = 90) {
 }
 
 make_age_bands <- function(df, bin = 5){
-  max_age <- ceiling(max(df$age_num, na.rm = TRUE)/bin) * bin
+  max_age <- suppressWarnings(max(df$age_num, na.rm = TRUE))
+  if (!is.finite(max_age)) {
+    return(df |>
+             mutate(age_band = factor(rep(NA_character_, nrow(df)), levels = character())))
+  }
+
+  upper <- max(bin, ceiling(max_age / bin) * bin)
+  breaks <- seq(0, upper + bin, by = bin)
+
   df |>
-    mutate(age_band = cut(age_num, breaks = seq(0, max_age, by = bin), right = FALSE, include.lowest = TRUE))
+    mutate(age_band = cut(age_num, breaks = breaks, right = FALSE, include.lowest = TRUE))
 }
 
 # GRID3 helpers ---------------------------------------------------------------
