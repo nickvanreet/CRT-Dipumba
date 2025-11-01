@@ -54,6 +54,8 @@ rename_by_regex <- function(df){
     sex_text        = "^sexe",
     zone            = "zone.*sante",
     province        = "^province$",
+    structure_sanitaire = "(structure.*sanit|structure.*sanitaire)",
+    unite_mobile    = "(unite.*mobile|mobile.*unit)",
     temp_field      = "temperature.*transport",
     temp_cpltha     = "temperature.*stockage.*cpltha",
     study           = "^(etude|study)$"
@@ -176,7 +178,7 @@ join_extractions_biobank <- function(extractions, biobank){
     left_join(
       biobank |>
         select(
-          Barcode, LabID, zone, province, date_prelev,
+          Barcode, LabID, zone, province, structure_sanitaire, unite_mobile, date_prelev,
           date_env_cpltha, date_rec_cpltha, date_env_inrb
         ),
       by = c("code_barres_kps" = "Barcode", "numero" = "LabID")
@@ -365,6 +367,8 @@ qcUI <- function(id){
           ),
           selectInput(ns("qc_prov"), "Provincie", choices = "Alle", selected = "Alle"),
           selectInput(ns("qc_zone"), "Zone de santé", choices = "Alle", selected = "Alle"),
+          selectInput(ns("qc_structure"), "Structure sanitaire", choices = "Alle", selected = "Alle"),
+          selectInput(ns("qc_unit"), "Unité mobile", choices = "Alle", selected = "Alle"),
           dateRangeInput(
             ns("qc_date_rng"), "Filter op datum de prélèvement",
             start = NULL, end = NULL, format = "yyyy-mm-dd", weekstart = 1
@@ -475,12 +479,19 @@ qcServer <- function(id, biobank){
       if (is.null(df) || !nrow(df) || !"province" %in% names(df)) {
         updateSelectInput(session, "qc_prov", choices = "Alle", selected = "Alle")
         updateSelectInput(session, "qc_zone", choices = "Alle", selected = "Alle")
+        updateSelectInput(session, "qc_structure", choices = "Alle", selected = "Alle")
+        updateSelectInput(session, "qc_unit", choices = "Alle", selected = "Alle")
         return()
       }
 
       provs <- sort(unique(na.omit(df$province)))
       sel_prov <- if (input$qc_prov %in% c("Alle", provs)) input$qc_prov else "Alle"
       updateSelectInput(session, "qc_prov", choices = c("Alle", provs), selected = sel_prov)
+
+      structures <- if ("structure_sanitaire" %in% names(df)) sort(unique(na.omit(df$structure_sanitaire))) else character()
+      sel_structure <- input$qc_structure
+      if (is.null(sel_structure) || !sel_structure %in% c("Alle", structures)) sel_structure <- "Alle"
+      updateSelectInput(session, "qc_structure", choices = c("Alle", structures), selected = sel_structure)
 
       rng <- suppressWarnings(range(df$date_prelev, na.rm = TRUE))
       if (all(is.finite(rng))) {
@@ -503,6 +514,23 @@ qcServer <- function(id, biobank){
       updateSelectInput(session, "qc_zone", choices = c("Alle", zones), selected = sel_zone)
     }, ignoreNULL = FALSE)
 
+    observeEvent(list(input$qc_structure, qc_dedup()), {
+      df <- qc_dedup()
+      if (is.null(df) || !nrow(df) || !"unite_mobile" %in% names(df)) {
+        updateSelectInput(session, "qc_unit", choices = "Alle", selected = "Alle")
+        return()
+      }
+
+      df_units <- df
+      if (!is.null(input$qc_structure) && input$qc_structure != "Alle" && "structure_sanitaire" %in% names(df_units)) {
+        df_units <- df_units |> dplyr::filter(!is.na(structure_sanitaire) & structure_sanitaire == input$qc_structure)
+      }
+      units <- sort(unique(na.omit(df_units$unite_mobile)))
+      sel_unit <- input$qc_unit
+      if (is.null(sel_unit) || !sel_unit %in% c("Alle", units)) sel_unit <- "Alle"
+      updateSelectInput(session, "qc_unit", choices = c("Alle", units), selected = sel_unit)
+    }, ignoreNULL = FALSE)
+
     qc_filtered <- reactive({
       df <- qc_dedup()
       if (is.null(df) || !nrow(df) || !"volume_ml" %in% names(df)) return(tibble())
@@ -515,6 +543,14 @@ qcServer <- function(id, biobank){
 
       if (!is.null(input$qc_zone) && input$qc_zone != "Alle" && "zone" %in% names(df)) {
         df <- df |> filter(!is.na(zone) & zone == input$qc_zone)
+      }
+
+      if (!is.null(input$qc_structure) && input$qc_structure != "Alle" && "structure_sanitaire" %in% names(df)) {
+        df <- df |> filter(!is.na(structure_sanitaire) & structure_sanitaire == input$qc_structure)
+      }
+
+      if (!is.null(input$qc_unit) && input$qc_unit != "Alle" && "unite_mobile" %in% names(df)) {
+        df <- df |> filter(!is.na(unite_mobile) & unite_mobile == input$qc_unit)
       }
 
       if (!is.null(input$qc_date_rng) && length(input$qc_date_rng) == 2 && all(!is.na(input$qc_date_rng)) && "date_prelev" %in% names(df)) {
@@ -651,7 +687,7 @@ qcServer <- function(id, biobank){
     output$qc_per_sample_tbl <- renderDT({
       df <- qc_filtered()
       if (!nrow(df)) df <- tibble()
-      keep <- c("province", "zone", "numero", "code_barres_kps", "date_prelev", "date_rec_cpltha",
+      keep <- c("province", "zone", "structure_sanitaire", "unite_mobile", "numero", "code_barres_kps", "date_prelev", "date_rec_cpltha",
                 "date_env_cpltha", "date_env_inrb", "volume_ml", "volume_num", "file_date", "source_file", "flag")
       datatable(df |>
                   select(any_of(keep)) |>
@@ -669,7 +705,7 @@ qcServer <- function(id, biobank){
           arrange(volume_num) |>
           mutate(reason = ifelse(volume_num < rng[1], "Low volume", "High volume")) # Reason column for QC outliers
       }
-      keep <- c("province", "zone", "numero", "code_barres_kps", "volume_ml", "volume_num", "date_prelev", "file_date", "source_file", "reason")
+      keep <- c("province", "zone", "structure_sanitaire", "unite_mobile", "numero", "code_barres_kps", "volume_ml", "volume_num", "date_prelev", "file_date", "source_file", "reason")
       datatable(df |> select(any_of(keep)), options = list(pageLength = 20, scrollX = TRUE))
     })
 
@@ -680,7 +716,7 @@ qcServer <- function(id, biobank){
       } else {
         flagged <- flagged |> filter(flag != "OK")
       }
-      keep <- c("flag", "province", "zone", "numero", "code_barres_kps", "volume_ml", "volume_num", "date_prelev", "file_date", "source_file")
+      keep <- c("flag", "province", "zone", "structure_sanitaire", "unite_mobile", "numero", "code_barres_kps", "volume_ml", "volume_num", "date_prelev", "file_date", "source_file")
       datatable(flagged |> select(any_of(keep)), options = list(pageLength = 20, scrollX = TRUE))
     })
 
@@ -873,6 +909,8 @@ ui <- page_fluid(
         selectInput("study", "Filter studie", choices = c("Alle"), selected = "Alle"),
         uiOutput("province_ui"),
         uiOutput("zone_ui"),
+        uiOutput("structure_ui"),
+        uiOutput("mobile_ui"),
         checkboxGroupInput("sex", "Geslacht", choices = c("M", "F"), selected = c("M", "F"), inline = TRUE),
         sliderInput("age_rng", "Leeftijd", min = 0, max = 110, value = c(0, 80))
       ),
@@ -1104,7 +1142,13 @@ server <- function(input, output, session){
         province_raw = province,
         zone_raw = zone,
         prov_key = normalize_names(province),
-        zone_key = normalize_names(zone)
+        zone_key = normalize_names(zone),
+        structure_sanitaire = dplyr::na_if(trimws(as.character(structure_sanitaire)), ""),
+        unite_mobile = dplyr::na_if(trimws(as.character(unite_mobile)), ""),
+        structure_key = normalize_names(structure_sanitaire),
+        mobile_key = normalize_names(unite_mobile),
+        structure_key = dplyr::na_if(structure_key, ""),
+        mobile_key = dplyr::na_if(mobile_key, "")
       )
     if (!nrow(df)) return(NULL)
     df
@@ -1152,6 +1196,38 @@ server <- function(input, output, session){
     zones <- sort(unique(na.omit(df$zone)))
     if (!length(zones)) return(helpText("Geen zones gevonden."))
     selectizeInput("zone", "Filter zone", choices = zones, selected = zones, multiple = TRUE, options = list(plugins = list("remove_button")))
+  })
+
+  output$structure_ui <- renderUI({
+    df <- biobank(); if (is.null(df)) return(NULL)
+    structures <- sort(unique(na.omit(df$structure_sanitaire)))
+    if (!length(structures)) return(helpText("Geen structure sanitaire-waarden gevonden."))
+    current <- isolate(input$structure)
+    selected <- if (is.null(current) || !length(current)) structures else intersect(current, structures)
+    if (!length(selected)) selected <- structures
+    selectizeInput(
+      "structure", "Filter structure sanitaire",
+      choices = structures, selected = selected, multiple = TRUE,
+      options = list(plugins = list("remove_button"))
+    )
+  })
+
+  output$mobile_ui <- renderUI({
+    df <- biobank(); if (is.null(df)) return(NULL)
+    df_filtered <- df
+    if (!is.null(input$structure) && length(input$structure)) {
+      df_filtered <- df_filtered |> dplyr::filter(is.na(structure_sanitaire) | structure_sanitaire %in% input$structure)
+    }
+    units <- sort(unique(na.omit(df_filtered$unite_mobile)))
+    if (!length(units)) return(helpText("Geen mobiele units gevonden."))
+    current <- isolate(input$mobile_unit)
+    selected <- if (is.null(current) || !length(current)) units else intersect(current, units)
+    if (!length(selected)) selected <- units
+    selectizeInput(
+      "mobile_unit", "Filter unité mobile",
+      choices = units, selected = selected, multiple = TRUE,
+      options = list(plugins = list("remove_button"))
+    )
   })
 
   transport_long <- reactive({
@@ -1451,6 +1527,8 @@ server <- function(input, output, session){
     if (!is.null(rng)) df <- df |> filter(is.na(date_prelev) | (date_prelev >= rng[1] & date_prelev <= rng[2]))
     if (!is.null(input$province) && length(input$province)) df <- df |> filter(is.na(province) | province %in% input$province)
     if (!is.null(input$zone) && length(input$zone))       df <- df |> filter(is.na(zone) | zone %in% input$zone)
+    if (!is.null(input$structure) && length(input$structure)) df <- df |> filter(is.na(structure_sanitaire) | structure_sanitaire %in% input$structure)
+    if (!is.null(input$mobile_unit) && length(input$mobile_unit)) df <- df |> filter(is.na(unite_mobile) | unite_mobile %in% input$mobile_unit)
     if (!is.null(input$study) && input$study != "Alle")  df <- df |> filter(toupper(study) == toupper(input$study))
     if (!is.null(input$sex)) df <- df |> filter(is.na(sex_clean) | sex_clean %in% input$sex)
     if (!is.null(input$age_rng) && length(input$age_rng) == 2) {
@@ -1552,22 +1630,34 @@ server <- function(input, output, session){
   })
 
   mobile_units <- reactive({
-    df <- filtered(); if (is.null(df) || !nrow(df)) return(tibble())
+    empty_units <- tibble(
+      unit = character(),
+      zone_label = character(),
+      lat = numeric(),
+      lon = numeric(),
+      n = integer(),
+      n_da = integer(),
+      n_dp = integer(),
+      last_sample = as.Date(character()),
+      has_coords = logical()
+    )
+
+    df <- filtered(); if (is.null(df) || !nrow(df)) return(empty_units)
 
     lat_col <- find_first_matching_column(df, c("latitude", "lat", "gps_lat", "lat_dd", "latitude_decimal", "coord_y", "y_coord"))
     lon_col <- find_first_matching_column(df, c("longitude", "lon", "gps_lon", "lon_dd", "longitude_decimal", "coord_x", "x_coord"))
-    if (is.null(lat_col) || is.null(lon_col)) return(tibble())
 
-    lat <- suppressWarnings(readr::parse_number(df[[lat_col]]))
-    lon <- suppressWarnings(readr::parse_number(df[[lon_col]]))
-    valid <- is.finite(lat) & is.finite(lon)
-    if (!any(valid)) return(tibble())
+    lat <- if (!is.null(lat_col)) suppressWarnings(readr::parse_number(df[[lat_col]])) else rep(NA_real_, nrow(df))
+    lon <- if (!is.null(lon_col)) suppressWarnings(readr::parse_number(df[[lon_col]])) else rep(NA_real_, nrow(df))
 
-    df_valid <- df[valid, , drop = FALSE]
-    lat <- lat[valid]
-    lon <- lon[valid]
+    df_valid <- df
 
-    unit_col <- find_first_matching_column(df_valid, c("mobile", "unite", "unit", "site", "facility", "centre"))
+    unit_col <- NULL
+    if ("unite_mobile" %in% names(df_valid)) {
+      unit_col <- "unite_mobile"
+    } else {
+      unit_col <- find_first_matching_column(df_valid, c("mobile", "unite", "unit", "site", "facility", "centre"))
+    }
     unit_raw <- if (!is.null(unit_col)) df_valid[[unit_col]] else df_valid$zone
     unit_clean <- stringr::str_trim(as.character(unit_raw))
 
@@ -1613,9 +1703,9 @@ server <- function(input, output, session){
           is.finite(last_sample),
           as.Date(last_sample, origin = "1970-01-01"),
           as.Date(NA)
-        )
+        ),
+        has_coords = is.finite(lat) & is.finite(lon)
       ) |>
-      filter(!is.na(lat), !is.na(lon)) |>
       arrange(desc(n))
   })
 
@@ -1840,10 +1930,11 @@ server <- function(input, output, session){
       )
 
     units <- mobile_units()
-    if (nrow(units)) {
+    units_map <- dplyr::filter(units, !is.na(has_coords) & has_coords)
+    if (nrow(units_map)) {
       map <- map |>
         addCircleMarkers(
-          data = units,
+          data = units_map,
           lng = ~lon, lat = ~lat,
           radius = ~pmax(4, sqrt(n)),
           color = "#ffffff", weight = 1,
@@ -1914,6 +2005,11 @@ server <- function(input, output, session){
     extras <- if (nrow(units) > 5) {
       list(tags$small(class = "text-muted", sprintf("+%s extra mobiele units", nrow(units) - 5)))
     } else list()
+
+    no_coord <- sum(!units$has_coords, na.rm = TRUE)
+    if (no_coord > 0) {
+      extras <- c(extras, list(tags$small(class = "text-muted", sprintf("%s unit(s) zonder coördinaten worden niet op de kaart getoond.", no_coord))))
+    }
 
     do.call(tagList, c(items, extras))
   })
