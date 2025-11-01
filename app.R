@@ -130,6 +130,12 @@ read_extractions_dir <- function(dir_extraction){
 
   purrr::map_dfr(files, read_one) |>
     mutate(
+      volume_raw = dplyr::coalesce(
+        .data[["volume_total_echantillon_sang_drs_ml"]],
+        .data[["volume_total_echantillon_sang_ml"]],
+        .data[["volume_ml"]],
+        .data[["volume"]]
+      ),
       volume_ml = suppressWarnings(as.numeric(volume_raw)),
       volume_ml = ifelse(!is.na(volume_ml) & volume_ml > 10, volume_ml / 10, volume_ml)
     )
@@ -889,7 +895,14 @@ server <- function(input, output, session){
 
   # ---------- Helpers voor normaliseren van namen ----------
   normalize_names <- function(x){
-    x <- ifelse(is.na(x), "", x)
+    if (is.list(x)) {
+      x <- vapply(x, function(v){
+        if (length(v) == 0 || all(is.na(v))) return("")
+        paste(as.character(unlist(v, use.names = FALSE)), collapse = " ")
+      }, FUN.VALUE = character(1))
+    }
+    x <- as.character(x)
+    x[is.na(x)] <- ""
     x <- stringi::stri_trans_general(x, "Latin-ASCII")
     x <- tolower(trimws(x))
     gsub("[\\s_-]+", " ", x)
@@ -1367,21 +1380,36 @@ server <- function(input, output, session){
       if (is.null(f)) return(NULL)
       sf <- try(sf::read_sf(f$datapath, quiet = TRUE), silent = TRUE)
       if (inherits(sf, "try-error")) {
+        sf <- try(sf::st_read(f$datapath, quiet = TRUE, stringsAsFactors = FALSE), silent = TRUE)
+      }
+      if (!inherits(sf, "sf")) {
         showNotification("Kon kaartlaag niet lezen. Controleer het bestand.", type = "error")
         return(NULL)
       }
-      if (inherits(sf, "sf")) flatten_grid3_cols(sf) else NULL
+      flatten_grid3_cols(sf)
     }
   })
 
   observe({
     g <- zones_sf()
     if (is.null(g)) return()
-    nms <- names(g)
-    cand_zone <- intersect(nms, c("zone","zonesante","zs","zs_name","nom_zs","name","NAME","NOM"))
-    cand_prov <- intersect(nms, c("province","prov","nom_prov","adm1name","ADM1NAME","NAME_1","name_1"))
-    updateSelectInput(session, "zones_name_col", choices = nms, selected = ifelse(length(cand_zone), cand_zone[1], nms[1]))
-    updateSelectInput(session, "prov_name_col",  choices = nms, selected = ifelse(length(cand_prov), cand_prov[1], nms[1]))
+    geom_col <- attr(g, "sf_column")
+
+    simple_cols <- setdiff(names(g), geom_col)
+    simple_cols <- simple_cols[ !vapply(g[simple_cols], is.list, TRUE) ]
+    if (!length(simple_cols)) simple_cols <- setdiff(names(g), geom_col)
+
+    cand_zone <- intersect(simple_cols, c("zone","zonesante","zs","zs_name","nom_zs","name","NAME","NOM"))
+    cand_prov <- intersect(simple_cols, c("province","prov","nom_prov","adm1name","ADM1NAME","NAME_1","name_1"))
+
+    updateSelectInput(session, "zones_name_col",
+      choices  = simple_cols,
+      selected = if (length(cand_zone)) cand_zone[1] else simple_cols[1]
+    )
+    updateSelectInput(session, "prov_name_col",
+      choices  = simple_cols,
+      selected = if (length(cand_prov)) cand_prov[1] else simple_cols[1]
+    )
   })
 
   zone_summary <- reactive({
@@ -1407,18 +1435,23 @@ server <- function(input, output, session){
     s <- zone_summary()
     if (is.null(g) || is.null(s) || !nrow(s)) return(NULL)
     req(input$zones_name_col, input$prov_name_col)
-    g$zone_key <- normalize_names(g[[input$zones_name_col]])
-    g$prov_key <- normalize_names(g[[input$prov_name_col]])
-    s$zone_key <- normalize_names(s$zone)
-    s$prov_key <- normalize_names(s$province)
-    gj <- dplyr::left_join(g, s, by = c("zone_key", "prov_key")) # Join on normalized zone + province
+    g$zone_key <- normalize_names(as.character(g[[input$zones_name_col]]))
+    g$prov_key <- normalize_names(as.character(g[[input$prov_name_col]]))
+    s$zone_key <- normalize_names(as.character(s$zone))
+    s$prov_key <- normalize_names(as.character(s$province))
+
+    gj <- dplyr::left_join(g, s, by = c("zone_key", "prov_key"))
+
     metric <- switch(input$map_metric_zs,
-                     n = gj$n,
-                     pct_f = gj$pct_f,
-                     med_age = gj$med_age,
-                     gj$n)
-    pal <- colorBin("YlGnBu", domain = metric, bins = input$map_bins_zs, na.color = "#cccccc")
-    list(gj = gj, metric = metric, pal = pal)
+      n      = gj$n,
+      pct_f  = gj$pct_f,
+      med_age= gj$med_age,
+      gj$n
+    )
+    metric_num <- suppressWarnings(as.numeric(metric))
+    pal <- colorBin("YlGnBu", domain = metric_num, bins = input$map_bins_zs, na.color = "#cccccc")
+
+    list(gj = gj, metric = metric_num, pal = pal)
   })
 
   output$map_zones <- renderLeaflet({
