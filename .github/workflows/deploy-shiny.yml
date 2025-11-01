@@ -1,0 +1,87 @@
+name: Deploy Shiny (shinyapps.io)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: SHINYAPPS_ACCOUNT
+    env:
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+      SHINYAPPS_ACCOUNT: ${{ secrets.SHINYAPPS_ACCOUNT }}
+      SHINYAPPS_TOKEN:   ${{ secrets.SHINYAPPS_TOKEN }}
+      SHINYAPPS_SECRET:  ${{ secrets.SHINYAPPS_SECRET }}
+      SHINYAPPS_APPNAME: ${{ secrets.SHINYAPPS_APPNAME }}
+      SHINYAPPS_DIR:     ${{ secrets.SHINYAPPS_DIR }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: 'release'
+          use-public-rspm: true
+
+      - uses: r-lib/actions/setup-pandoc@v2
+
+      - name: System libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libcurl4-openssl-dev libssl-dev libxml2-dev pkg-config \
+            libicu-dev \
+            libfontconfig1-dev libharfbuzz-dev libfribidi-dev \
+            libfreetype6-dev libpng-dev libtiff5-dev libjpeg-dev \
+            libudunits2-dev libgdal-dev libgeos-dev libproj-dev gdal-bin
+
+      - name: Preflight secrets
+        shell: bash
+        run: |
+          for v in SHINYAPPS_ACCOUNT SHINYAPPS_TOKEN SHINYAPPS_SECRET; do
+            if [ -z "${!v}" ]; then
+              echo "::error title=Missing secret::$v is empty or undefined"
+              exit 1
+            else
+              echo "$v present (length ${#v})"
+            fi
+          done
+          
+      - name: Install R deps for manifest
+        run: |
+          Rscript -e 'install.packages("pak", repos="https://cloud.r-project.org")'
+          Rscript -e 'pak::pak(c(
+            "shiny","tidyverse","readxl","janitor","lubridate","DT",
+            "sf","leaflet","stringi","bslib","glue","rsconnect"
+          ))'
+
+      - name: Write rsconnect manifest
+        run: |
+          Rscript -e '
+            dir <- Sys.getenv("SHINYAPPS_DIR"); if(dir=="") dir <- ".";
+            rsconnect::writeManifest(appDir = dir)
+          '
+
+      - name: Deploy to shinyapps.io
+        run: |
+          Rscript -e '
+            library(rsconnect)
+            acc <- Sys.getenv("SHINYAPPS_ACCOUNT")
+            app <- Sys.getenv("SHINYAPPS_APPNAME")
+            dir <- Sys.getenv("SHINYAPPS_DIR"); if(dir=="") dir <- "."
+            setAccountInfo(
+              name   = acc,
+              token  = trimws(Sys.getenv("SHINYAPPS_TOKEN")),
+              secret = trimws(Sys.getenv("SHINYAPPS_SECRET")),
+              server = "shinyapps.io"
+            )
+            rsconnect::deployApp(
+              appDir = dir,
+              appName = app,
+              account = acc,
+              server  = "shinyapps.io",
+              forceUpdate = TRUE
+            )
+          '
