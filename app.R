@@ -20,6 +20,8 @@ suppressPackageStartupMessages({
   library(plotly)          # Added for optional interactive pyramids
 })
 
+options(shiny.maxRequestSize = 200 * 1024^2) # Allow uploads up to ~200 MB for offline map layers
+
 # -----------------------------------------------------------------------------
 # 1) Helpers
 # -----------------------------------------------------------------------------
@@ -113,13 +115,31 @@ read_extractions_dir <- function(dir_extraction){
   files <- list.files(dir_extraction, pattern = "\\.xlsx?$", full.names = TRUE)
   if (!length(files)) return(tibble())
 
+  errors <- list()
+
   read_one <- function(f){
-    sneak <- suppressMessages(readxl::read_excel(f, n_max = 1))
+    sneak <- try(suppressMessages(readxl::read_excel(f, n_max = 1)), silent = TRUE)
+    if (inherits(sneak, "try-error") || is.null(sneak)) {
+      cond <- attr(sneak, "condition")
+      msg <- if (!is.null(cond) && inherits(cond, "condition")) conditionMessage(cond) else as.character(sneak)
+      errors[[basename(f)]] <<- msg
+      return(tibble())
+    }
     col_types <- rep("text", ncol(sneak))
-    dat <- suppressMessages(
-      readxl::read_excel(f, col_types = col_types, .name_repair = "minimal") |>
-        janitor::clean_names()
-    ) |>
+    dat <- try(
+      suppressMessages(
+        readxl::read_excel(f, col_types = col_types, .name_repair = "minimal") |>
+          janitor::clean_names()
+      ),
+      silent = TRUE
+    )
+    if (inherits(dat, "try-error") || is.null(dat)) {
+      cond <- attr(dat, "condition")
+      msg <- if (!is.null(cond) && inherits(cond, "condition")) conditionMessage(cond) else as.character(dat)
+      errors[[basename(f)]] <<- msg
+      return(tibble())
+    }
+    dat |>
       mutate(
         source_file = basename(f),
         file_date = {
@@ -145,7 +165,18 @@ read_extractions_dir <- function(dir_extraction){
     dat
   }
 
-  purrr::map_dfr(files, read_one) |>
+  res <- purrr::map_dfr(files, read_one)
+  if (length(errors)) {
+    keep <- vapply(errors, function(x) {
+      if (is.null(x)) return(FALSE)
+      val <- paste(x, collapse = "")
+      nzchar(val)
+    }, logical(1))
+    errors <- errors[keep]
+  }
+  attr(res, "errors") <- errors
+
+  res |>
     mutate(
       volume_raw = dplyr::coalesce(
         .data[["volume_total_echantillon_sang_drs_ml"]],
@@ -259,12 +290,19 @@ clean_age_sex <- function(df){
       ),
       age_num = ifelse(dplyr::between(age_num, 0, 110), age_num, NA_real_),
       sex_clean = recode(toupper(trimws(sex_text)), "M" = "M", "F" = "F", .default = NA_character_),
-      study = case_when(
-        is.na(study) ~ NA_character_,
-        str_detect(toupper(study), "^DA$") ~ "DA",
-        str_detect(toupper(study), "^DP$") ~ "DP",
-        TRUE ~ study
-      )
+      study = {
+        study_chr <- trimws(as.character(study))
+        study_chr <- ifelse(study_chr %in% c("", "NA", "N/A"), NA_character_, study_chr)
+        study_norm <- stringi::stri_trans_general(toupper(study_chr), "Latin-ASCII")
+        case_when(
+          is.na(study_norm) ~ NA_character_,
+          str_detect(study_norm, "\\bDA\\b") ~ "DA",
+          str_detect(study_norm, "DIAG") & str_detect(study_norm, "ACTIF") ~ "DA",
+          str_detect(study_norm, "\\bDP\\b") ~ "DP",
+          str_detect(study_norm, "DIAG") & str_detect(study_norm, "PASSIF") ~ "DP",
+          TRUE ~ study_chr
+        )
+      }
     )
 }
 
@@ -407,6 +445,75 @@ flatten_grid3_cols <- function(x){
   x
 }
 
+read_uploaded_geo <- function(file_info){
+  if (is.null(file_info)) return(NULL)
+
+  ext <- tolower(tools::file_ext(file_info$name))
+  datapath <- file_info$datapath
+
+  if (!file.exists(datapath)) {
+    return(NULL)
+  }
+
+  copy_with_ext <- function(path, extension){
+    tmp <- tempfile(fileext = paste0(".", extension))
+    file.copy(path, tmp, overwrite = TRUE)
+    tmp
+  }
+
+  sf_obj <- NULL
+
+  if (ext == "rds") {
+    tmp <- copy_with_ext(datapath, ext)
+    sf_obj <- try(readRDS(tmp), silent = TRUE)
+  } else if (ext == "zip") {
+    tmp <- copy_with_ext(datapath, ext)
+    unzip_dir <- tempfile("grid3_zip")
+    dir.create(unzip_dir, showWarnings = FALSE, recursive = TRUE)
+    unzip_res <- try(utils::unzip(tmp, exdir = unzip_dir), silent = TRUE)
+    if (inherits(unzip_res, "try-error")) {
+      return(NULL)
+    }
+    shp_files <- list.files(unzip_dir, pattern = "\\.shp$", full.names = TRUE)
+    alt_files <- c(
+      list.files(unzip_dir, pattern = "\\.gpkg$", full.names = TRUE),
+      list.files(unzip_dir, pattern = "\\.geojson$", full.names = TRUE),
+      list.files(unzip_dir, pattern = "\\.json$", full.names = TRUE)
+    )
+    target_candidates <- c(shp_files, alt_files)
+    target <- if (length(target_candidates)) target_candidates[1] else unzip_dir
+    sf_obj <- try(sf::read_sf(target, quiet = TRUE), silent = TRUE)
+    if (inherits(sf_obj, "try-error")) {
+      sf_obj <- try(sf::st_read(target, quiet = TRUE, stringsAsFactors = FALSE), silent = TRUE)
+    }
+  } else if (ext %in% c("geojson", "json", "gpkg", "shp")) {
+    tmp <- copy_with_ext(datapath, ext)
+    sf_obj <- try(sf::read_sf(tmp, quiet = TRUE), silent = TRUE)
+    if (inherits(sf_obj, "try-error")) {
+      sf_obj <- try(sf::st_read(tmp, quiet = TRUE, stringsAsFactors = FALSE), silent = TRUE)
+    }
+  } else {
+    tmp <- datapath
+    sf_obj <- try(sf::read_sf(tmp, quiet = TRUE), silent = TRUE)
+    if (inherits(sf_obj, "try-error")) {
+      sf_obj <- try(sf::st_read(tmp, quiet = TRUE, stringsAsFactors = FALSE), silent = TRUE)
+    }
+  }
+
+  if (inherits(sf_obj, "try-error") || is.null(sf_obj)) {
+    return(NULL)
+  }
+
+  if (!inherits(sf_obj, "sf")) {
+    sf_obj <- try(sf::st_as_sf(sf_obj), silent = TRUE)
+    if (inherits(sf_obj, "try-error") || is.null(sf_obj)) {
+      return(NULL)
+    }
+  }
+
+  sf_obj
+}
+
 # QC module -------------------------------------------------------------------
 qcUI <- function(id){
   ns <- NS(id)
@@ -505,6 +612,18 @@ qcServer <- function(id, biobank){
       }
 
       dat <- read_extractions_dir(dir)
+      errs <- attr(dat, "errors")
+      if (is.list(errs) && length(errs)) {
+        errs_vec <- utils::head(errs, 3)
+        err_names <- names(errs_vec)
+        if (is.null(err_names)) err_names <- rep("", length(errs_vec))
+        name_label <- ifelse(!is.na(err_names) & nzchar(err_names), err_names, "Onbekend bestand")
+        msg <- paste(sprintf("%s: %s", name_label, unlist(errs_vec)), collapse = "\n")
+        extra <- if (length(errs) > length(errs_vec)) sprintf("\n(+ %s extra fout(en))", length(errs) - length(errs_vec)) else ""
+        note <- gsub("\n", "<br/>", paste0("Sommige bestanden konden niet gelezen worden:\n", msg, extra), fixed = TRUE)
+        showNotification(htmltools::HTML(note), type = "warning", duration = NULL)
+      }
+
       if (!nrow(dat)) {
         qc_status("Geen extraction-bestanden gevonden in deze map.")
         qc_raw(empty_extractions())
@@ -943,8 +1062,8 @@ ui <- page_fluid(
         uiOutput("grid3_status"),
         fileInput(
           "zones_geo",
-          "Gezondheidszones (GeoJSON/Shape of .zip)",
-          accept = c(".geojson", ".json", ".shp", ".zip"),
+          "Gezondheidszones (GeoJSON/Shape/.zip of RDS)",
+          accept = c(".geojson", ".json", ".shp", ".zip", ".gpkg", ".rds"),
           buttonLabel = "Kies bestand"
         ),
         selectInput("zones_name_col", "Kolom met ZS-naam (in kaartlaag)", choices = NULL),
@@ -1630,13 +1749,8 @@ server <- function(input, output, session){
         flatten_grid3_cols(sf)
       })
     } else {
-      f <- input$zones_geo
-      if (is.null(f)) return(NULL)
-      sf <- try(sf::read_sf(f$datapath, quiet = TRUE), silent = TRUE)
-      if (inherits(sf, "try-error")) {
-        sf <- try(sf::st_read(f$datapath, quiet = TRUE, stringsAsFactors = FALSE), silent = TRUE)
-      }
-      if (!inherits(sf, "sf")) {
+      sf <- read_uploaded_geo(input$zones_geo)
+      if (is.null(sf)) {
         showNotification("Kon kaartlaag niet lezen. Controleer het bestand.", type = "error")
         return(NULL)
       }
@@ -1745,9 +1859,11 @@ server <- function(input, output, session){
     ) |>
       mutate(
         unit = dplyr::coalesce(dplyr::na_if(unit, ""), "Mobiele unit onbekend"),
-        zone_label = dplyr::coalesce(dplyr::na_if(zone_label, ""), "Zone onbekend")
+        zone_label = dplyr::coalesce(dplyr::na_if(zone_label, ""), "Zone onbekend"),
+        zone_key = dplyr::na_if(normalize_names(zone_name), ""),
+        prov_key = dplyr::na_if(normalize_names(province_name), "")
       ) |>
-      group_by(unit, zone_label) |>
+      group_by(unit, zone_label, zone_key, prov_key) |>
       summarise(
         lat = suppressWarnings(mean(lat, na.rm = TRUE)),
         lon = suppressWarnings(mean(lon, na.rm = TRUE)),
@@ -1769,6 +1885,45 @@ server <- function(input, output, session){
         ),
         has_coords = is.finite(lat) & is.finite(lon)
       ) |>
+      { units_tbl <- .
+        if (all(units_tbl$has_coords, na.rm = TRUE)) return(units_tbl)
+
+        zones <- zones_sf()
+        if (is.null(zones) || !inherits(zones, "sf")) return(units_tbl)
+
+        zone_col <- input$zones_name_col
+        prov_col <- input$prov_name_col
+
+        if (!is.character(zone_col) || !nzchar(zone_col) || !zone_col %in% names(zones) ||
+            !is.character(prov_col) || !nzchar(prov_col) || !prov_col %in% names(zones)) {
+          return(units_tbl)
+        }
+
+        zones$zone_key <- dplyr::na_if(normalize_names(as.character(zones[[zone_col]])), "")
+        zones$prov_key <- dplyr::na_if(normalize_names(as.character(zones[[prov_col]])), "")
+        zones_points <- suppressWarnings(sf::st_point_on_surface(zones))
+        coords <- suppressWarnings(sf::st_coordinates(zones_points))
+        if (!nrow(coords)) {
+          return(units_tbl)
+        }
+        lat_idx <- if ("Y" %in% colnames(coords)) "Y" else 2
+        lon_idx <- if ("X" %in% colnames(coords)) "X" else 1
+        zones_lookup <- tibble(
+          zone_key = zones$zone_key,
+          prov_key = zones$prov_key,
+          lat_zone = coords[, lat_idx],
+          lon_zone = coords[, lon_idx]
+        )
+
+        units_tbl |>
+          left_join(zones_lookup, by = c("zone_key", "prov_key")) |>
+          mutate(
+            lat = dplyr::if_else(has_coords, lat, lat_zone),
+            lon = dplyr::if_else(has_coords, lon, lon_zone),
+            has_coords = is.finite(lat) & is.finite(lon)
+          ) |>
+          select(-lat_zone, -lon_zone)
+      } |>
       arrange(desc(n))
   })
 
@@ -1916,10 +2071,10 @@ server <- function(input, output, session){
     s <- zone_summary()
     if (is.null(g) || is.null(s) || !nrow(s)) return(NULL)
     req(input$zones_name_col, input$prov_name_col)
-    g$zone_key <- normalize_names(as.character(g[[input$zones_name_col]]))
-    g$prov_key <- normalize_names(as.character(g[[input$prov_name_col]]))
-    s$zone_key <- normalize_names(as.character(s$zone))
-    s$prov_key <- normalize_names(as.character(s$province))
+    g$zone_key <- dplyr::na_if(normalize_names(as.character(g[[input$zones_name_col]])), "")
+    g$prov_key <- dplyr::na_if(normalize_names(as.character(g[[input$prov_name_col]])), "")
+    s$zone_key <- dplyr::na_if(normalize_names(as.character(s$zone)), "")
+    s$prov_key <- dplyr::na_if(normalize_names(as.character(s$province)), "")
 
     gj <- dplyr::left_join(g, s, by = c("zone_key", "prov_key"))
     gj$zone_uid <- dplyr::coalesce(gj$zone_uid, paste(gj$zone_key, gj$prov_key, sep = "__"))
