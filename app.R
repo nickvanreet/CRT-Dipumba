@@ -121,10 +121,10 @@ read_extractions_dir <- function(dir_extraction){
     sneak <- try(suppressMessages(readxl::read_excel(f, n_max = 1)), silent = TRUE)
     if (inherits(sneak, "try-error") || is.null(sneak)) {
       cond <- attr(sneak, "condition")
-      msg <- if (!is.null(cond) && inherits(cond, "condition")) conditionMessage(cond) else as.character(sneak)
-      errors[[basename(f)]] <<- msg
+      errors[[basename(f)]] <<- if (!is.null(cond)) conditionMessage(cond) else NULL
       return(tibble())
     }
+
     col_types <- rep("text", ncol(sneak))
     dat <- try(
       suppressMessages(
@@ -135,12 +135,12 @@ read_extractions_dir <- function(dir_extraction){
     )
     if (inherits(dat, "try-error") || is.null(dat)) {
       cond <- attr(dat, "condition")
-      msg <- if (!is.null(cond) && inherits(cond, "condition")) conditionMessage(cond) else as.character(dat)
-      errors[[basename(f)]] <<- msg
+      errors[[basename(f)]] <<- if (!is.null(cond)) conditionMessage(cond) else NULL
       return(tibble())
     }
-    dat |>
-      mutate(
+
+    dat <- dat |>
+      dplyr::mutate(
         source_file = basename(f),
         file_date = {
           m <- stringr::str_match(basename(f), "^(\\d{6})")
@@ -1228,9 +1228,10 @@ server <- function(input, output, session){
     gsub("[\\s_-]+", " ", x)
   }
 
-  used_file    <- reactiveVal("")
-  chosen_file  <- reactiveVal(NULL)
-  biobank_root <- reactiveVal(NULL)
+  used_file      <- reactiveVal("")
+  chosen_file    <- reactiveVal(NULL)
+  biobank_root   <- reactiveVal(NULL)
+  zone_hover_id  <- reactiveVal(NULL)
 
   app_dir <- normalizePath(".", winslash = "/", mustWork = TRUE)
   cache_dir <- file.path(app_dir, ".cache")
@@ -1242,8 +1243,12 @@ server <- function(input, output, session){
     paths <- tryCatch(readRDS(cache_file), error = function(e) NULL)
     if (is.list(paths)) {
       stored_paths(paths)
-      if (!is.null(paths$root)) updateTextInput(session, "root", value = paths$root)
-      if (!is.null(paths$qc_dir)) updateTextInput(session, "qc-qc_dir", value = paths$qc_dir)
+      if (!is.null(paths$root)) {
+        updateTextInput(session, "root", value = paths$root)
+      }
+      if (!is.null(paths$qc_dir)) {
+        updateTextInput(session, "qc-qc_dir", value = paths$qc_dir)
+      }
     } else {
       stored_paths(list(root = isolate(input$root), qc_dir = NULL))
     }
@@ -1413,7 +1418,10 @@ server <- function(input, output, session){
   })
 
   transport_long <- reactive({
-    df <- filtered(); if (is.null(df) || !nrow(df)) return(NULL)
+    df <- filtered()
+    if (is.null(df) || !nrow(df)) return(NULL)
+    df <- df |> dplyr::filter(!is.na(date_prelev))
+    if (!nrow(df)) return(NULL)
 
     has_field_temp <- "temp_field" %in% names(df)
     has_cpltha_temp <- "temp_cpltha" %in% names(df)
@@ -1931,9 +1939,6 @@ server <- function(input, output, session){
       } |>
       arrange(desc(n))
   })
-
-  zone_hover_id <- reactiveVal(NULL)
-
   observeEvent(input$map_zones_shape_mouseover, {
     ev <- input$map_zones_shape_mouseover
     if (!is.null(ev$id)) zone_hover_id(ev$id)
