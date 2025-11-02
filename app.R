@@ -1864,81 +1864,80 @@ server <- function(input, output, session){
       lon = lon,
       study = df_valid$study,
       last_sample_num = last_sample_num
-    ) |>
-      mutate(
-        unit = dplyr::coalesce(dplyr::na_if(unit, ""), "Mobiele unit onbekend"),
-        zone_label = dplyr::coalesce(dplyr::na_if(zone_label, ""), "Zone onbekend"),
-        zone_key = dplyr::na_if(normalize_names(zone_name), ""),
-        prov_key = dplyr::na_if(normalize_names(province_name), "")
       ) |>
-      group_by(unit, zone_label, zone_key, prov_key) |>
-      summarise(
-        lat = suppressWarnings(mean(lat, na.rm = TRUE)),
-        lon = suppressWarnings(mean(lon, na.rm = TRUE)),
-        n = dplyr::n(),
-        n_da = sum(toupper(study) == "DA", na.rm = TRUE),
-        n_dp = sum(toupper(study) == "DP", na.rm = TRUE),
-        last_sample = suppressWarnings(max(last_sample_num, na.rm = TRUE)),
-        .groups = "drop"
-      ) |>
-      mutate(
-        lat = ifelse(is.finite(lat), lat, NA_real_),
-        lon = ifelse(is.finite(lon), lon, NA_real_),
-        n_da = dplyr::coalesce(as.integer(n_da), 0L),
-        n_dp = dplyr::coalesce(as.integer(n_dp), 0L),
-        last_sample = dplyr::if_else(
-          is.finite(last_sample),
-          as.Date(last_sample, origin = "1970-01-01"),
-          as.Date(NA)
-        ),
-        has_coords = is.finite(lat) & is.finite(lon)
-      ) |>
-      {
-        units_tbl <- .
-        if (all(units_tbl$has_coords, na.rm = TRUE)) {
-          return(units_tbl)
-        }
+        mutate(
+          unit = dplyr::coalesce(dplyr::na_if(unit, ""), "Mobiele unit onbekend"),
+          zone_label = dplyr::coalesce(dplyr::na_if(zone_label, ""), "Zone onbekend"),
+          zone_key = dplyr::na_if(normalize_names(zone_name), ""),
+          prov_key = dplyr::na_if(normalize_names(province_name), "")
+        ) |>
+        group_by(unit, zone_label, zone_key, prov_key) |>
+        summarise(
+          lat = suppressWarnings(mean(lat, na.rm = TRUE)),
+          lon = suppressWarnings(mean(lon, na.rm = TRUE)),
+          n = dplyr::n(),
+          n_da = sum(toupper(study) == "DA", na.rm = TRUE),
+          n_dp = sum(toupper(study) == "DP", na.rm = TRUE),
+          last_sample = suppressWarnings(max(last_sample_num, na.rm = TRUE)),
+          .groups = "drop"
+        ) |>
+        mutate(
+          lat = ifelse(is.finite(lat), lat, NA_real_),
+          lon = ifelse(is.finite(lon), lon, NA_real_),
+          n_da = dplyr::coalesce(as.integer(n_da), 0L),
+          n_dp = dplyr::coalesce(as.integer(n_dp), 0L),
+          last_sample = dplyr::if_else(
+            is.finite(last_sample),
+            as.Date(last_sample, origin = "1970-01-01"),
+            as.Date(NA)
+          ),
+          has_coords = is.finite(lat) & is.finite(lon)
+        ) |>
+        (\(units_tbl) {
+          if (all(units_tbl$has_coords, na.rm = TRUE)) {
+            return(units_tbl)
+          }
 
-        zones <- zones_sf()
-        if (is.null(zones) || !inherits(zones, "sf")) {
-          return(units_tbl)
-        }
+          zones <- zones_sf()
+          if (is.null(zones) || !inherits(zones, "sf")) {
+            return(units_tbl)
+          }
 
-        zone_col <- input$zones_name_col
-        prov_col <- input$prov_name_col
+          zone_col <- input$zones_name_col
+          prov_col <- input$prov_name_col
 
-        if (!is.character(zone_col) || !nzchar(zone_col) || !zone_col %in% names(zones) ||
-            !is.character(prov_col) || !nzchar(prov_col) || !prov_col %in% names(zones)) {
-          return(units_tbl)
-        }
+          if (!is.character(zone_col) || !nzchar(zone_col) || !zone_col %in% names(zones) ||
+              !is.character(prov_col) || !nzchar(prov_col) || !prov_col %in% names(zones)) {
+            return(units_tbl)
+          }
 
-        zones$zone_key <- dplyr::na_if(normalize_names(as.character(zones[[zone_col]])), "")
-        zones$prov_key <- dplyr::na_if(normalize_names(as.character(zones[[prov_col]])), "")
-        zones_points <- suppressWarnings(sf::st_point_on_surface(zones))
-        coords <- suppressWarnings(sf::st_coordinates(zones_points))
-        if (!nrow(coords)) {
-          return(units_tbl)
-        }
-        lat_idx <- if ("Y" %in% colnames(coords)) "Y" else 2
-        lon_idx <- if ("X" %in% colnames(coords)) "X" else 1
-        zones_lookup <- tibble(
-          zone_key = zones$zone_key,
-          prov_key = zones$prov_key,
-          lat_zone = coords[, lat_idx],
-          lon_zone = coords[, lon_idx]
-        )
+          zones$zone_key <- dplyr::na_if(normalize_names(as.character(zones[[zone_col]])), "")
+          zones$prov_key <- dplyr::na_if(normalize_names(as.character(zones[[prov_col]])), "")
+          zones_points <- suppressWarnings(sf::st_point_on_surface(zones))
+          coords <- suppressWarnings(sf::st_coordinates(zones_points))
+          if (!nrow(coords)) {
+            return(units_tbl)
+          }
+          lat_idx <- if ("Y" %in% colnames(coords)) "Y" else 2
+          lon_idx <- if ("X" %in% colnames(coords)) "X" else 1
+          zones_lookup <- tibble(
+            zone_key = zones$zone_key,
+            prov_key = zones$prov_key,
+            lat_zone = coords[, lat_idx],
+            lon_zone = coords[, lon_idx]
+          )
 
-        units_tbl |>
-          left_join(zones_lookup, by = c("zone_key", "prov_key")) |>
-          mutate(
-            lat = dplyr::if_else(has_coords, lat, lat_zone),
-            lon = dplyr::if_else(has_coords, lon, lon_zone),
-            has_coords = is.finite(lat) & is.finite(lon)
-          ) |>
-          select(-lat_zone, -lon_zone)
-      } |>
-      arrange(desc(n))
-  })
+          units_tbl |>
+            left_join(zones_lookup, by = c("zone_key", "prov_key")) |>
+            mutate(
+              lat = dplyr::if_else(has_coords, lat, lat_zone),
+              lon = dplyr::if_else(has_coords, lon, lon_zone),
+              has_coords = is.finite(lat) & is.finite(lon)
+            ) |>
+            select(-lat_zone, -lon_zone)
+        }) |>
+        arrange(desc(n))
+    })
   observeEvent(input$map_zones_shape_mouseover, {
     ev <- input$map_zones_shape_mouseover
     if (!is.null(ev$id)) zone_hover_id(ev$id)
