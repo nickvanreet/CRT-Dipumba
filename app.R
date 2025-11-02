@@ -1,26 +1,18 @@
-# app.R — MBUJI-MAYI BIOBANK AGE–SEX (Shiny)
-# -----------------------------------------------------------------------------
-# New: bestandskeuze + diagnose-tab om snel te zien waarom plots leeg zijn.
-# -----------------------------------------------------------------------------
+# app.R — DRC Provinces & Biobank Snapshot (minimal)
+# ----------------------------------------------
 
 suppressPackageStartupMessages({
   library(shiny)
-  library(bslib)
-  library(tidyverse)
-  library(readxl)
-  library(janitor)
-  library(lubridate)
-  library(glue)
-  library(DT)
-  library(sf)
   library(leaflet)
-  library(stringi)
-  library(shinycssloaders) # Added for loading spinners
-  library(memoise)         # Added for memoised GRID3 downloads
-  library(plotly)          # Added for optional interactive pyramids
+  library(sf)
+  library(dplyr)
+  library(readxl)
+  library(RColorBrewer)
+  library(htmltools)
+  library(tibble)
 })
 
-options(shiny.maxRequestSize = 200 * 1024^2) # Allow uploads up to ~200 MB for offline map layers
+options(shiny.maxRequestSize = 200 * 1024^2)
 
 # -----------------------------------------------------------------------------
 # 1) Helpers
@@ -46,389 +38,139 @@ latest_biobank <- function(dir_biobank){
   list(path = file_path, data = df)
 }
 
-read_specific_biobank <- function(file_path){
-  if (is.null(file_path) || !file.exists(file_path)) return(NULL)
-  df <- tryCatch(readxl::read_excel(file_path, .name_repair = "minimal") |> janitor::clean_names(), error = function(e) NULL)
-  list(path = file_path, data = df)
+keyify <- function(x){
+  x <- as.character(x); x[is.na(x)] <- ""
+  x <- iconv(x, from = "", to = "ASCII//TRANSLIT")
+  tolower(trimws(gsub("[^a-z0-9]+", " ", x)))
 }
 
-rename_by_regex <- function(df){
-  patterns <- list(
-    Barcode         = "(code.*barre|barcode)",
-    LabID           = "^(numero|num[ _-]*ech|lab[_-]*id)$",
-    date_prelev     = "date.*prelev",
-    date_env_cpltha = "date.*envoi.*cpltha",
-    date_rec_cpltha = "date.*reception.*cpltha",
-    date_env_inrb   = "date.*envoi.*inrb",
-    age_text        = "(^age$|age_ou_annee.*naiss|annee.*naiss)",
-    sex_text        = "^sexe",
-    zone            = "zone.*sante",
-    province        = "^province$",
-    structure_sanitaire = "(structure.*sanit|structure.*sanitaire)",
-    unite_mobile    = "(unite.*mobile|mobile.*unit)",
-    temp_field      = "temperature.*transport",
-    temp_cpltha     = "temperature.*stockage.*cpltha",
-    study           = "^(etude|study)$"
-  )
-  out <- df
-  for (new in names(patterns)){
-    pat <- patterns[[new]]
-    hit <- grep(pat, names(out), ignore.case = TRUE, value = TRUE)
-    if (length(hit) >= 1) {
-      out <- dplyr::rename(out, !!new := dplyr::all_of(hit[1]))
-    } else {
-      out[[new]] <- NA_character_
-    }
+repair_column_names <- function(nms){
+  if (is.null(nms)) return(nms)
+  nms <- as.character(nms)
+  blanks <- which(is.na(nms) | trimws(nms) == "")
+  if (length(blanks)) {
+    nms[blanks] <- paste0("unnamed_", seq_along(blanks))
   }
-  out
+  make.unique(nms, sep = "_")
 }
 
-find_first_matching_column <- function(df, patterns){
-  if (is.null(df) || !ncol(df)) return(NULL)
-  nms <- names(df)
-  lower <- tolower(nms)
-  for (pat in patterns) {
-    idx <- which(lower == pat)
-    if (length(idx)) return(nms[idx[1]])
-  }
-  for (pat in patterns) {
-    idx <- which(grepl(pat, lower, fixed = FALSE))
-    if (length(idx)) return(nms[idx[1]])
-  }
-  NULL
+first_existing <- function(paths){
+  paths <- unique(paths)
+  paths[file.exists(paths)]
 }
 
-parse_any_date <- function(x_chr){
-  x_chr <- trimws(as.character(x_chr))
-  x_chr[x_chr %in% c("", "NA", "N/A", "na", "NaN", "NULL")] <- NA
-  out <- as.Date(rep(NA_integer_, length(x_chr)), origin = "1970-01-01")
-  is_num <- grepl("^\\d+$", x_chr)
-  if (any(is_num)) suppressWarnings({ out[is_num] <- as.Date(as.numeric(x_chr[is_num]), origin = "1899-12-30") })
-  idx <- !is_num & !is.na(x_chr)
-  if (any(idx)) {
-    tmp <- sub("[ T].*$", "", x_chr[idx])
-    tmp <- gsub("[.\\-]", "/", tmp)
-    p <- suppressWarnings(lubridate::dmy(tmp)); miss <- is.na(p)
-    if (any(miss)) p[miss] <- suppressWarnings(lubridate::ymd(tmp[miss]))
-    miss <- is.na(p)
-    if (any(miss)) p[miss] <- suppressWarnings(lubridate::mdy(tmp[miss]))
-    out[idx] <- p
+read_sf_any <- function(path){
+  ext <- tolower(tools::file_ext(path))
+  if (ext %in% c("gpkg", "geojson", "json", "shp")) {
+    suppressMessages(sf::read_sf(path, quiet = TRUE))
+  } else if (ext %in% c("rds", "rda")) {
+    readRDS(path)
+  } else {
+    stop(sprintf("Unsupported spatial format: %s", basename(path)))
   }
-  out
 }
 
-read_extractions_dir <- function(dir_extraction){
-  if (!dir.exists(dir_extraction)) return(tibble())
-
-  files <- list.files(dir_extraction, pattern = "\\.xlsx?$", full.names = TRUE)
-  if (!length(files)) return(tibble())
-
-  errors <- list()
-
-  read_one <- function(f){
-    sneak <- try(suppressMessages(readxl::read_excel(f, n_max = 1)), silent = TRUE)
-    if (inherits(sneak, "try-error") || is.null(sneak)) {
-      cond <- attr(sneak, "condition")
-      errors[[basename(f)]] <<- if (!is.null(cond)) conditionMessage(cond) else NULL
-      return(tibble())
-    }
-
-    col_types <- rep("text", ncol(sneak))
-    dat <- try(
-      suppressMessages(
-        readxl::read_excel(f, col_types = col_types, .name_repair = "minimal") |>
-          janitor::clean_names()
-      ),
-      silent = TRUE
-    )
-    if (inherits(dat, "try-error") || is.null(dat)) {
-      cond <- attr(dat, "condition")
-      errors[[basename(f)]] <<- if (!is.null(cond)) conditionMessage(cond) else NULL
-      return(tibble())
-    }
-
-    dat <- dat |>
-      dplyr::mutate(
-        source_file = basename(f),
-        file_date = {
-          m <- stringr::str_match(basename(f), "^(\\d{6})")
-          if (!is.na(m[1, 2])) as.Date(m[1, 2], format = "%y%m%d") else as.Date(NA)
-        }
-      )
-
-    date_cols <- c(
-      "date_de_prelevement_jj_mm_aaaa",
-      "date_envoi_vers_cpltha_jj_mm_aaaa",
-      "date_de_reception_cpltha_jj_mm_aaaa",
-      "date_denvoi_inrb"
-    )
-    for (dc in date_cols) {
-      if (dc %in% names(dat)) dat[[dc]] <- parse_any_date(dat[[dc]])
-    }
-
-    if ("code_barres_kps" %in% names(dat)) {
-      dat <- dat |>
-        filter(!(is.na(code_barres_kps) | code_barres_kps == ""))
-    }
-    dat
-  }
-
-  res <- purrr::map_dfr(files, read_one)
-  if (length(errors)) {
-    keep <- vapply(errors, function(x) {
-      if (is.null(x)) return(FALSE)
-      val <- paste(x, collapse = "")
-      nzchar(val)
-    }, logical(1))
-    errors <- errors[keep]
-  }
-  attr(res, "errors") <- errors
-
-  res |>
-    mutate(
-      volume_raw = dplyr::coalesce(
-        .data[["volume_total_echantillon_sang_drs_ml"]],
-        .data[["volume_total_echantillon_sang_ml"]],
-        .data[["volume_ml"]],
-        .data[["volume"]]
-      ),
-      volume_ml = suppressWarnings(as.numeric(volume_raw)),
-      volume_ml = ifelse(!is.na(volume_ml) & volume_ml > 10, volume_ml / 10, volume_ml)
-    )
-}
-
-join_extractions_biobank <- function(extractions, biobank){
-  if (is.null(extractions) || !nrow(extractions) || is.null(biobank) || !nrow(biobank)) {
-    return(tibble())
-  }
-
-  if (!"code_barres_kps" %in% names(extractions)) {
-    extractions$code_barres_kps <- NA_character_
-  }
-  if (!"numero" %in% names(extractions)) {
-    extractions$numero <- NA_character_
-  }
-
-  extractions |>
-    mutate(
-      numero = as.character(numero),
-      code_barres_kps = as.character(code_barres_kps)
-    ) |>
-    left_join(
-      biobank |>
-        select(
-          Barcode, LabID, zone, province, structure_sanitaire, unite_mobile, date_prelev,
-          date_env_cpltha, date_rec_cpltha, date_env_inrb
-        ),
-      by = c("code_barres_kps" = "Barcode", "numero" = "LabID")
-    )
-}
-
-flag_extractions <- function(extractions_joined){
-  if (is.null(extractions_joined) || !nrow(extractions_joined)) {
-    return(list(flagged = tibble(), dedup = tibble()))
-  }
-
-  dups_exact <- extractions_joined |>
-    mutate(vol_key = round(as.numeric(volume_ml), 2)) |>
-    group_by(code_barres_kps, numero, vol_key) |>
-    filter(dplyr::n() > 1) |>
-    ungroup()
-
-  same_barcode_diff_num <- extractions_joined |>
-    filter(!is.na(code_barres_kps)) |>
-    group_by(code_barres_kps) |>
-    filter(dplyr::n_distinct(numero, na.rm = TRUE) > 1) |>
-    ungroup()
-
-  reextractions <- same_barcode_diff_num |>
-    group_by(code_barres_kps) |>
-    filter(dplyr::n_distinct(round(as.numeric(volume_ml), 2), na.rm = TRUE) > 1) |>
-    ungroup()
-
-  same_barcode_same_vol_new_num <- same_barcode_diff_num |>
-    group_by(code_barres_kps) |>
-    filter(dplyr::n_distinct(round(as.numeric(volume_ml), 2), na.rm = TRUE) == 1) |>
-    ungroup()
-
-  same_numero_diff_barcode <- extractions_joined |>
-    filter(!is.na(numero)) |>
-    group_by(numero) |>
-    filter(dplyr::n_distinct(code_barres_kps, na.rm = TRUE) > 1) |>
-    ungroup()
-
-  extractions_flagged <- extractions_joined |>
-    mutate(
-      vol_key = round(as.numeric(volume_ml), 2),
-      flag = case_when(
-        paste(code_barres_kps, numero, vol_key) %in%
-          paste(dups_exact$code_barres_kps, dups_exact$numero, dups_exact$vol_key)
-        ~ "EXACT_DUPLICATE",
-        code_barres_kps %in% reextractions$code_barres_kps &
-          numero %in% reextractions$numero
-        ~ "RE_EXTRACTION_SAME_BARCODE_DIFF_NUM_DIFF_VOL",
-        code_barres_kps %in% same_barcode_same_vol_new_num$code_barres_kps &
-          numero %in% same_barcode_same_vol_new_num$numero
-        ~ "SUSPECT_SAME_BARCODE_SAME_VOL_NEW_NUM",
-        numero %in% same_numero_diff_barcode$numero &
-          code_barres_kps %in% same_numero_diff_barcode$code_barres_kps
-        ~ "SUSPECT_SAME_NUM_DIFF_BARCODE",
-        TRUE ~ "OK"
-      )
-    )
-
-  extractions_dedup <- extractions_flagged |>
-    arrange(code_barres_kps, numero, desc(file_date)) |>
-    group_by(code_barres_kps, numero, round(as.numeric(volume_ml), 2)) |>
-    slice(1) |>
-    ungroup()
-
-  list(flagged = extractions_flagged, dedup = extractions_dedup)
-}
-
-clean_age_sex <- function(df){
-  df |>
-    mutate(
-      age_num = readr::parse_number(age_text),
-      age_num = case_when(
-        is.na(age_num) ~ NA_real_,
-        age_num > 1900 & !is.na(date_prelev) ~ lubridate::year(date_prelev) - age_num, # Use sample date to compute age
-        age_num > 1900 ~ NA_real_,
-        TRUE ~ age_num
-      ),
-      age_num = ifelse(dplyr::between(age_num, 0, 110), age_num, NA_real_),
-      sex_clean = recode(toupper(trimws(sex_text)), "M" = "M", "F" = "F", .default = NA_character_),
-      study = {
-        study_chr <- trimws(as.character(study))
-        study_chr <- ifelse(study_chr %in% c("", "NA", "N/A"), NA_character_, study_chr)
-        study_norm <- stringi::stri_trans_general(toupper(study_chr), "Latin-ASCII")
-        case_when(
-          is.na(study_norm) ~ NA_character_,
-          str_detect(study_norm, "\\bDA\\b") ~ "DA",
-          str_detect(study_norm, "DIAG") & str_detect(study_norm, "ACTIF") ~ "DA",
-          str_detect(study_norm, "\\bDP\\b") ~ "DP",
-          str_detect(study_norm, "DIAG") & str_detect(study_norm, "PASSIF") ~ "DP",
-          TRUE ~ study_chr
-        )
-      }
-    )
-}
-
-safe_days <- function(to, from, max_ok = 90) {
-  d <- as.numeric(difftime(to, from, units = "days"))
-  d[!is.finite(d) | d < 0 | d > max_ok] <- NA_real_
-  d
-}
-
-make_age_bands <- function(df, bin = 5){
-  max_age <- suppressWarnings(max(df$age_num, na.rm = TRUE))
-  if (!is.finite(max_age)) {
-    return(df |>
-             mutate(age_band = factor(rep(NA_character_, nrow(df)), levels = character())))
-  }
-
-  upper <- max(bin, ceiling(max_age / bin) * bin)
-  breaks <- seq(0, upper + bin, by = bin)
-
-  df |>
-    mutate(age_band = cut(age_num, breaks = breaks, right = FALSE, include.lowest = TRUE))
-}
-
-# GRID3 helpers ---------------------------------------------------------------
-read_grid3_health_zones_impl <- function(
-    fields = c("province", "zonesante", "zs_uid"),
-    local_paths = NULL
-){
-  normalise_fields <- function(sf_obj) {
-    nms <- names(sf_obj)
-    if (!"province"  %in% nms) names(sf_obj)[match(tolower(nms), "province")]  <- "province"
-    if (!"zonesante" %in% nms) names(sf_obj)[match(tolower(nms), "zonesante")] <- "zonesante"
-    if (!"zs_uid"    %in% nms && "zsuid" %in% tolower(nms)) {
-      names(sf_obj)[match(tolower(nms), "zsuid")] <- "zs_uid"
-    }
-    sf_obj
-  }
-
-  read_local_candidate <- function(path) {
-    if (!nzchar(path) || !file.exists(path)) {
-      return(NULL)
-    }
-
-    fmt <- tolower(tools::file_ext(path))
-
-    sf_obj <- switch(
-      fmt,
-      rds = try(readRDS(path), silent = TRUE),
-      {
-        # allow zipped shapefiles by using the "zip://" prefix automatically
-        to_read <- if (fmt == "zip") paste0("zip://", normalizePath(path)) else path
-        try(sf::read_sf(to_read, quiet = TRUE), silent = TRUE)
-      }
-    )
-
-    if (inherits(sf_obj, "try-error") || is.null(sf_obj)) {
-      return(NULL)
-    }
-
-    if (!inherits(sf_obj, "sf")) {
-      sf_obj <- try(sf::st_as_sf(sf_obj), silent = TRUE)
-      if (inherits(sf_obj, "try-error") || is.null(sf_obj)) {
-        return(NULL)
-      }
-    }
-
-    if (!nrow(sf_obj)) {
-      return(NULL)
-    }
-
-    sf_obj <- normalise_fields(sf_obj)
-    keep <- unique(c(fields, attr(sf_obj, "sf_column")))
-    suppressWarnings(sf_obj[, intersect(keep, names(sf_obj)), drop = FALSE])
-  }
-
-  local_defaults <- c(
-    Sys.getenv("GRID3_HEALTH_ZONES_FILE", unset = ""),
-    local_paths,
-    file.path("data", "grid3_health_zones.rds"),
+# Load health zones (gpkg/rds/geojson), normalise names/CRS, build province layer
+load_health_zones <- function(){
+  candidates <- c(
+    Sys.getenv("GRID3_HEALTH_ZONES_FILE"),
     file.path("data", "grid3_health_zones.gpkg"),
+    file.path("data", "grid3_health_zones.rds"),
     file.path("data", "grid3_health_zones.geojson"),
-    file.path("www", "grid3_health_zones.geojson"),
+    file.path("data", "health_zones_offline.geojson"),
     file.path("www", "grid3_health_zones.gpkg"),
-    file.path("www", "grid3_health_zones.rds")
+    file.path("www", "grid3_health_zones.rds"),
+    file.path("www", "grid3_health_zones.geojson")
+  )
+  candidates <- first_existing(candidates)
+  if (!length(candidates)) {
+    stop("Place a GRID3 health-zone layer in data/ or www/ (gpkg, rds, geojson).")
+  }
+
+  g <- read_sf_any(candidates[1])
+  stopifnot(inherits(g, "sf"))
+
+  nm <- names(g)
+  i_prov <- which(tolower(nm) == "province")[1]
+  if (is.na(i_prov)) stop("Couldn't find a 'province' column in the zones layer.")
+  names(g)[i_prov] <- "province"
+
+  i_zone <- which(tolower(nm) %in% c("zonesante", "zone_sante", "zone", "health_zone"))[1]
+  if (is.na(i_zone)) stop("Couldn't find a 'zonesante' / health-zone column.")
+  names(g)[i_zone] <- "zonesante"
+
+  geom_col <- attr(g, "sf_column")
+  if (!identical(geom_col, "geometry")) {
+    names(g)[names(g) == geom_col] <- "geometry"
+    attr(g, "sf_column") <- "geometry"
+  }
+
+  g <- sf::st_make_valid(g)
+  g <- g[!sf::st_is_empty(g), ]
+
+  if (is.na(sf::st_crs(g))) sf::st_crs(g) <- 4326
+  g <- sf::st_transform(g, 4326)
+
+  g <- mutate(g, prov_key = keyify(province), zone_key = keyify(zonesante))
+
+  g3857 <- sf::st_transform(g, 3857)
+  geom_col2 <- attr(g3857, "sf_column")
+  if (!identical(geom_col2, "geometry")) {
+    names(g3857)[names(g3857) == geom_col2] <- "geometry"
+    attr(g3857, "sf_column") <- "geometry"
+  }
+
+  provinces <- g3857 %>%
+    group_by(province, prov_key) %>%
+    summarise(geometry = sf::st_union(geometry), .groups = "drop") %>%
+    sf::st_as_sf() %>%
+    sf::st_transform(4326) %>%
+    sf::st_make_valid()
+
+  provs <- sort(unique(g$province))
+  pal <- RColorBrewer::brewer.pal(min(max(3, min(length(provs), 12)), 12), "Set3")
+  cols <- setNames(rep(pal, length.out = length(provs)), provs)
+  g$prov_col <- cols[match(g$province, names(cols))]
+
+  list(zones = g, provinces = provinces, cols = cols, source = candidates[1])
+}
+
+normalise_biobank <- function(df){
+  if (is.null(df)) return(tibble())
+  df <- tibble::as_tibble(df)
+  nms <- tolower(names(df))
+  names(df) <- nms
+
+  get_match <- function(options){
+    for (opt in options) {
+      idx <- which(nms == opt)
+      if (length(idx)) return(names(df)[idx[1]])
+    }
+    NULL
+  }
+
+  rename_map <- list(
+    province = get_match(c("province", "prov", "adm1", "province_name", "name_1")),
+    study    = get_match(c("study", "etude", "programme", "project")),
+    age      = get_match(c("age", "age_years", "age_num", "age_yrs")),
+    sex      = get_match(c("sex", "sexe", "gender"))
   )
 
-  for (candidate in unique(local_defaults)) {
-    sf_obj <- read_local_candidate(candidate)
-    if (!is.null(sf_obj)) {
-      return(sf_obj)
+  for (nm in names(rename_map)) {
+    col <- rename_map[[nm]]
+    if (!is.null(col)) {
+      df <- dplyr::rename(df, !!nm := dplyr::all_of(col))
+    } else {
+      df[[nm]] <- NA
     }
   }
 
-  bases <- c(
-    "https://services3.arcgis.com/BU6Aadhn6tbBEdyk/arcgis/rest/services/GRID3_COD_health_zones_v7_0/FeatureServer/0/query",
-    "https://services3.arcgis.com/BU6Aadhn6tbBEdyk/arcgis/rest/services/GRID3_COD_health_zones_v6_0/FeatureServer/0/query",
-    "https://services3.arcgis.com/BU6Aadhn6tbBEdyk/arcgis/rest/services/GRID3_COD_health_zones_v5_0/FeatureServer/0/query"
+  df |> dplyr::mutate(
+    province = trimws(as.character(province)),
+    study    = trimws(as.character(study)),
+    age      = suppressWarnings(as.numeric(age)),
+    sex      = toupper(trimws(as.character(sex)))
   )
-  q <- function(base, fld) {
-    fld <- paste(fld, collapse = ",")
-    paste0(base,
-           "?where=1%3D1&outFields=", utils::URLencode(fld, reserved = TRUE),
-           "&outSR=4326&f=geojson")
-  }
-  errs <- list()
-  for (b in bases) {
-    url <- q(b, fields)
-    sf_obj <- try(sf::read_sf(url, quiet = TRUE), silent = TRUE)
-    if (!inherits(sf_obj, "try-error") && nrow(sf_obj) > 0) {
-      sf_obj <- normalise_fields(sf_obj)
-      return(sf_obj)
-    }
-    errs[[b]] <- if (inherits(sf_obj, "try-error")) as.character(sf_obj) else "no rows"
-  }
-  stop("Could not fetch GRID3 health zones from public endpoints.\n",
-       "Some services now require an access token.\n",
-       "Tried:\n- ", paste(names(errs), collapse = "\n- "),
-       "\nIf blocked, download the file from GRID3’s DRC data page and read locally.")
 }
 
 # Memoise the public download to avoid repeated requests within a session
@@ -583,35 +325,12 @@ read_geo_path <- function(path){
     if (inherits(sf_obj, "try-error")) {
       sf_obj <- try(sf::st_read(path, quiet = TRUE, stringsAsFactors = FALSE), silent = TRUE)
     }
-  }
 
-  if (inherits(sf_obj, "try-error") || is.null(sf_obj)) {
-    return(NULL)
-  }
-
-  if (!inherits(sf_obj, "sf")) {
-    sf_obj <- try(sf::st_as_sf(sf_obj), silent = TRUE)
-    if (inherits(sf_obj, "try-error") || is.null(sf_obj)) {
-      return(NULL)
+    if (is.data.frame(df)) {
+      names(df) <- repair_column_names(names(df))
     }
-  }
 
-  sf_obj
-}
-
-read_uploaded_geo <- function(file_info){
-  if (is.null(file_info)) return(NULL)
-
-  datapath <- file_info$datapath
-  if (!file.exists(datapath)) {
-    return(NULL)
-  }
-
-  ext <- tolower(tools::file_ext(file_info$name))
-  copy_with_ext <- function(path, extension){
-    tmp <- tempfile(fileext = if (nzchar(extension)) paste0(".", extension) else "")
-    file.copy(path, tmp, overwrite = TRUE)
-    tmp
+    df
   }
 
   tmp_path <- copy_with_ext(datapath, ext)
@@ -640,701 +359,61 @@ read_default_health_zones_impl <- function(){
     return(bundle)
   }
 
-  NULL
+  if (is.null(chosen)) {
+    sample_df <- tibble::tribble(
+      ~province,              ~study, ~age, ~sex,
+      "Kasaï-Oriental",       "DA",  22,    "F",
+      "Kasaï-Oriental",       "DA",  34,    "M",
+      "Kinshasa",             "DP",  19,    "F",
+      "Kinshasa",             "DA",  41,    "M",
+      "Nord-Kivu",            "DA",  27,    "F",
+      "Nord-Kivu",            "DP",  8,     "M",
+      "Sud-Kivu",             "DP",  15,    "F"
+    )
+    return(list(path = "Sample data", data = sample_df, sample = TRUE))
+  }
+
+  chosen$sample <- FALSE
+  chosen
 }
 
-read_default_health_zones <- memoise::memoise(read_default_health_zones_impl)
+biobank_summary <- function(df){
+  if (is.null(df) || !nrow(df)) return(tibble())
+  df |> normalise_biobank() |>
+    mutate(
+      province = ifelse(is.na(province) | province == "", "Unknown", province),
+      study = ifelse(is.na(study) | study == "", "Unknown", study),
+      prov_key = keyify(province)
+    ) |>
+    group_by(prov_key, province, study) |>
+    summarise(records = dplyr::n(), .groups = "drop") |>
+    arrange(province, study)
+}
 
-# QC module -------------------------------------------------------------------
-qcUI <- function(id){
-  ns <- NS(id)
+safe_total <- function(x){
+  x <- suppressWarnings(as.numeric(x))
+  x[is.na(x)] <- 0
+  x
+}
+
+# -------- UI -----------------------------------------------------------------
+
+ui <- fluidPage(
+  tags$head(tags$style(HTML(".leaflet-container { background: #f7f7f7; }"))),
+  titlePanel("DRC — Provinces, Health Zones & Biobank Snapshot"),
   fluidRow(
     column(
-      width = 3,
-      card(
-        card_header("Instellingen"),
-        card_body(
-          textInput(
-            ns("qc_dir"),
-            "Map met extraction-bestanden",
-            value = "C:/Users/nvanreet/ITG/THA - Digital Management System - CRT Dipumba Upload - CRT Dipumba Upload/02 - Extractions"
-          ),
-          actionButton(ns("qc_refresh"), "Vernieuwen"),
-          div(class = "mt-2", textOutput(ns("qc_status"))),
-          hr(),
-          sliderInput(
-            ns("qc_rng"), "Acceptabel volumebereik (mL)",
-            min = 0.5, max = 3.5, value = c(1.5, 2.5), step = 0.1
-          ),
-          selectInput(ns("qc_prov"), "Provincie", choices = "Alle", selected = "Alle"),
-          selectInput(ns("qc_zone"), "Zone de santé", choices = "Alle", selected = "Alle"),
-          selectInput(ns("qc_structure"), "Structure sanitaire", choices = "Alle", selected = "Alle"),
-          selectInput(ns("qc_unit"), "Unité mobile", choices = "Alle", selected = "Alle"),
-          dateRangeInput(
-            ns("qc_date_rng"), "Filter op datum de prélèvement",
-            start = NULL, end = NULL, format = "yyyy-mm-dd", weekstart = 1
-          ),
-          radioButtons(
-            ns("qc_agg"), "Tijdresolutie",
-            choices = c("Dag" = "day", "Maand" = "month", "Jaar" = "year"),
-            selected = "day", inline = TRUE
-          ),
-          checkboxInput(ns("qc_show_out"), "Toon enkel out-of-range", value = FALSE),
-          hr(),
-          downloadButton(ns("qc_dl_zone"), "Download Zone Summary (CSV)"),
-          downloadButton(ns("qc_dl_out"), "Download Outliers (CSV)"),
-          downloadButton(ns("qc_dl_dup"), "Download Duplicaten (CSV)"),
-          downloadButton(ns("qc_dl_filt"), "Download Gefilterde Dataset (CSV)"),
-          downloadButton(ns("qc_dl_agg"), "Download Tijdreeks (CSV)")
-        )
-      )
+      width = 4,
+      h4("Biobank source"),
+      fileInput("upload", "Upload biobank file (Excel/CSV/RDS)",
+                accept = c(".xlsx", ".xls", ".csv", ".rds")),
+      verbatimTextOutput("biobank_info", placeholder = TRUE),
+      h4("Biobank summary"),
+      tableOutput("summary_table")
     ),
     column(
-      width = 9,
-      tabsetPanel(
-        tabPanel(
-          "Overzicht",
-          withSpinner(plotOutput(ns("qc_hist_vol"), height = "320px")),
-          withSpinner(plotOutput(ns("qc_box_vol"), height = "260px"))
-        ),
-        tabPanel(
-          "Per Zone",
-          withSpinner(plotOutput(ns("qc_trend_filedate"), height = "320px")),
-          withSpinner(DTOutput(ns("qc_zone_tbl")))
-        ),
-        tabPanel(
-          "Tijdreeksen",
-          withSpinner(plotOutput(ns("qc_agg_count_plot"), height = "280px")),
-          withSpinner(plotOutput(ns("qc_agg_volume_plot"), height = "280px")),
-          withSpinner(DTOutput(ns("qc_agg_tbl")))
-        ),
-        tabPanel("Per-sample", withSpinner(DTOutput(ns("qc_per_sample_tbl")))),
-        tabPanel("Outliers", withSpinner(DTOutput(ns("qc_out_tbl")))),
-        tabPanel("Duplicaten", withSpinner(DTOutput(ns("qc_dup_tbl"))))
-      )
-    )
-  )
-}
-
-qcServer <- function(id, biobank){
-  moduleServer(id, function(input, output, session){
-    empty_extractions <- function(){
-      tibble(
-        code_barres_kps = character(),
-        numero = character(),
-        volume_ml = numeric(),
-        file_date = as.Date(character()),
-        source_file = character()
-      )
-    }
-
-    qc_status <- reactiveVal("Nog geen data geladen.")
-    qc_raw    <- reactiveVal(empty_extractions())
-
-    output$qc_status <- renderText({ qc_status() })
-
-    observeEvent(input$qc_refresh, {
-      dir <- normalizePath(input$qc_dir, winslash = "/", mustWork = FALSE)
-      if (!dir.exists(dir)) {
-        qc_status("Map bestaat niet. Controleer het pad.")
-        qc_raw(empty_extractions())
-        showNotification("Map bestaat niet. Controleer het pad.", type = "error")
-        return()
-      }
-
-      dat <- read_extractions_dir(dir)
-      errs <- attr(dat, "errors")
-      if (is.list(errs) && length(errs)) {
-        errs_vec <- utils::head(errs, 3)
-        err_names <- names(errs_vec)
-        if (is.null(err_names)) err_names <- rep("", length(errs_vec))
-        name_label <- ifelse(!is.na(err_names) & nzchar(err_names), err_names, "Onbekend bestand")
-        msg <- paste(sprintf("%s: %s", name_label, unlist(errs_vec)), collapse = "\n")
-        extra <- if (length(errs) > length(errs_vec)) sprintf("\n(+ %s extra fout(en))", length(errs) - length(errs_vec)) else ""
-        note <- gsub("\n", "<br/>", paste0("Sommige bestanden konden niet gelezen worden:\n", msg, extra), fixed = TRUE)
-        showNotification(htmltools::HTML(note), type = "warning", duration = NULL)
-      }
-
-      if (!nrow(dat)) {
-        qc_status("Geen extraction-bestanden gevonden in deze map.")
-        qc_raw(empty_extractions())
-        showNotification("Geen extraction-bestanden gevonden in deze map.", type = "warning")
-        return()
-      }
-
-      qc_raw(dat)
-      file_count <- length(unique(na.omit(dat$source_file)))
-      sample_count <- nrow(dat)
-      msg <- sprintf(
-        "%s bestanden · %s stalen",
-        scales::comma(file_count),
-        scales::comma(sample_count)
-      )
-      qc_status(msg)
-    })
-
-    qc_joined <- reactive({
-      join_extractions_biobank(qc_raw(), biobank())
-    })
-
-    qc_flagged_data <- reactive({
-      flag_extractions(qc_joined())
-    })
-
-    qc_dedup <- reactive({
-      res <- qc_flagged_data()
-      dedup <- res$dedup
-      if (is.null(dedup)) tibble() else dedup
-    })
-
-    observeEvent(qc_dedup(), {
-      df <- qc_dedup()
-      if (is.null(df) || !nrow(df) || !"province" %in% names(df)) {
-        updateSelectInput(session, "qc_prov", choices = "Alle", selected = "Alle")
-        updateSelectInput(session, "qc_zone", choices = "Alle", selected = "Alle")
-        updateSelectInput(session, "qc_structure", choices = "Alle", selected = "Alle")
-        updateSelectInput(session, "qc_unit", choices = "Alle", selected = "Alle")
-        return()
-      }
-
-      provs <- sort(unique(na.omit(df$province)))
-      sel_prov <- if (input$qc_prov %in% c("Alle", provs)) input$qc_prov else "Alle"
-      updateSelectInput(session, "qc_prov", choices = c("Alle", provs), selected = sel_prov)
-
-      structures <- if ("structure_sanitaire" %in% names(df)) sort(unique(na.omit(df$structure_sanitaire))) else character()
-      sel_structure <- input$qc_structure
-      if (is.null(sel_structure) || !sel_structure %in% c("Alle", structures)) sel_structure <- "Alle"
-      updateSelectInput(session, "qc_structure", choices = c("Alle", structures), selected = sel_structure)
-
-      rng <- suppressWarnings(range(df$date_prelev, na.rm = TRUE))
-      if (all(is.finite(rng))) {
-        updateDateRangeInput(session, "qc_date_rng", start = rng[1], end = rng[2], min = rng[1], max = rng[2])
-      }
-    })
-
-    observeEvent(list(input$qc_prov, qc_dedup()), {
-      df <- qc_dedup()
-      if (is.null(df) || !nrow(df) || !"zone" %in% names(df)) {
-        updateSelectInput(session, "qc_zone", choices = "Alle", selected = "Alle")
-        return()
-      }
-
-      zones <- sort(unique(na.omit(df$zone)))
-      if (!is.null(input$qc_prov) && input$qc_prov != "Alle" && "province" %in% names(df)) {
-        zones <- sort(unique(na.omit(df$zone[df$province == input$qc_prov])))
-      }
-      sel_zone <- if (input$qc_zone %in% c("Alle", zones)) input$qc_zone else "Alle"
-      updateSelectInput(session, "qc_zone", choices = c("Alle", zones), selected = sel_zone)
-    }, ignoreNULL = FALSE)
-
-    observeEvent(list(input$qc_structure, qc_dedup()), {
-      df <- qc_dedup()
-      if (is.null(df) || !nrow(df) || !"unite_mobile" %in% names(df)) {
-        updateSelectInput(session, "qc_unit", choices = "Alle", selected = "Alle")
-        return()
-      }
-
-      df_units <- df
-      if (!is.null(input$qc_structure) && input$qc_structure != "Alle" && "structure_sanitaire" %in% names(df_units)) {
-        df_units <- df_units |> dplyr::filter(!is.na(structure_sanitaire) & structure_sanitaire == input$qc_structure)
-      }
-      units <- sort(unique(na.omit(df_units$unite_mobile)))
-      sel_unit <- input$qc_unit
-      if (is.null(sel_unit) || !sel_unit %in% c("Alle", units)) sel_unit <- "Alle"
-      updateSelectInput(session, "qc_unit", choices = c("Alle", units), selected = sel_unit)
-    }, ignoreNULL = FALSE)
-
-    qc_filtered <- reactive({
-      df <- qc_dedup()
-      if (is.null(df) || !nrow(df) || !"volume_ml" %in% names(df)) return(tibble())
-
-      df <- df |> mutate(volume_num = suppressWarnings(as.numeric(volume_ml)))
-
-      if (!is.null(input$qc_prov) && input$qc_prov != "Alle" && "province" %in% names(df)) {
-        df <- df |> filter(!is.na(province) & province == input$qc_prov)
-      }
-
-      if (!is.null(input$qc_zone) && input$qc_zone != "Alle" && "zone" %in% names(df)) {
-        df <- df |> filter(!is.na(zone) & zone == input$qc_zone)
-      }
-
-      if (!is.null(input$qc_structure) && input$qc_structure != "Alle" && "structure_sanitaire" %in% names(df)) {
-        df <- df |> filter(!is.na(structure_sanitaire) & structure_sanitaire == input$qc_structure)
-      }
-
-      if (!is.null(input$qc_unit) && input$qc_unit != "Alle" && "unite_mobile" %in% names(df)) {
-        df <- df |> filter(!is.na(unite_mobile) & unite_mobile == input$qc_unit)
-      }
-
-      if (!is.null(input$qc_date_rng) && length(input$qc_date_rng) == 2 && all(!is.na(input$qc_date_rng)) && "date_prelev" %in% names(df)) {
-        d1 <- as.Date(input$qc_date_rng[1])
-        d2 <- as.Date(input$qc_date_rng[2])
-        df <- df |> filter(!is.na(date_prelev) & date_prelev >= d1 & date_prelev <= d2)
-      }
-
-      if (isTRUE(input$qc_show_out) && "volume_num" %in% names(df)) {
-        rng <- input$qc_rng
-        df <- df |> filter(!is.na(volume_num) & (volume_num < rng[1] | volume_num > rng[2]))
-      }
-
-      df
-    })
-
-    qc_agg_data <- reactive({
-      df <- qc_filtered()
-      if (is.null(df) || !nrow(df) || !"date_prelev" %in% names(df) || !"volume_num" %in% names(df)) return(tibble())
-
-      df <- df |> filter(!is.na(date_prelev))
-      if (!nrow(df)) return(tibble())
-
-      agg <- input$qc_agg
-      df <- df |>
-        mutate(
-          period = dplyr::case_when(
-            agg == "day"   ~ date_prelev,
-            agg == "month" ~ lubridate::floor_date(date_prelev, unit = "month"),
-            agg == "year"  ~ as.Date(sprintf("%s-01-01", lubridate::year(date_prelev))),
-            TRUE ~ date_prelev
-          )
-        )
-
-      rng <- input$qc_rng
-      df |>
-        group_by(period) |>
-        summarise(
-          N = dplyr::n(),
-          Median = suppressWarnings(stats::median(volume_num, na.rm = TRUE)),
-          P10 = suppressWarnings(stats::quantile(volume_num, 0.10, na.rm = TRUE, names = FALSE)),
-          P90 = suppressWarnings(stats::quantile(volume_num, 0.90, na.rm = TRUE, names = FALSE)),
-          Out = sum(!is.na(volume_num) & (volume_num < rng[1] | volume_num > rng[2])),
-          `% Out` = round(100 * Out / pmax(N, 1), 1),
-          .groups = "drop"
-        ) |>
-        arrange(period)
-    })
-
-    output$qc_hist_vol <- renderPlot({
-      df <- qc_filtered()
-      validate(need(nrow(df) > 0, "Geen data beschikbaar."))
-      rng <- input$qc_rng
-      ggplot(df, aes(x = volume_num)) +
-        geom_histogram(binwidth = 0.1, fill = "#2C3E50", colour = "white") +
-        geom_vline(xintercept = rng, linetype = "dashed", colour = "red") +
-        labs(title = "Samplevolumes", x = "Volume (mL)", y = "Frequentie") +
-        theme_minimal()
-    })
-
-    output$qc_box_vol <- renderPlot({
-      df <- qc_filtered()
-      validate(need(nrow(df) > 0, "Geen data beschikbaar."))
-      ggplot(df, aes(x = "", y = volume_num)) +
-        geom_boxplot(fill = "#18BC9C", alpha = 0.7) +
-        labs(title = "Boxplot samplevolumes", x = NULL, y = "Volume (mL)") +
-        theme_minimal()
-    })
-
-    output$qc_trend_filedate <- renderPlot({
-      df <- qc_filtered()
-      validate(need(nrow(df) > 0, "Geen data beschikbaar."))
-      ggplot(df, aes(x = file_date, y = volume_num)) +
-        geom_point(alpha = 0.4) +
-        geom_smooth(method = "loess", se = FALSE, colour = "#2980B9") +
-        geom_hline(yintercept = 2, linetype = "dashed", colour = "red") +
-        labs(title = "Samplevolumes doorheen extraction batches", x = "file_date", y = "Volume (mL)") +
-        theme_minimal()
-    })
-
-    output$qc_zone_tbl <- renderDT({
-      df <- qc_filtered()
-      if (!nrow(df) || !all(c("province", "zone", "volume_num") %in% names(df))) {
-        return(datatable(tibble(), options = list(pageLength = 15, scrollX = TRUE)))
-      }
-      rng <- input$qc_rng
-      summ <- df |>
-        group_by(province, zone) |>
-        summarise(
-          N = dplyr::n(),
-          Out = sum(!is.na(volume_num) & (volume_num < rng[1] | volume_num > rng[2])),
-          `% Out` = round(100 * Out / pmax(N, 1), 1),
-          Median = round(stats::median(volume_num, na.rm = TRUE), 2),
-          P10 = round(stats::quantile(volume_num, 0.10, na.rm = TRUE, names = FALSE), 2),
-          P90 = round(stats::quantile(volume_num, 0.90, na.rm = TRUE, names = FALSE), 2),
-          .groups = "drop"
-        ) |>
-        arrange(desc(`% Out`), desc(N))
-      datatable(summ, options = list(pageLength = 15, scrollX = TRUE))
-    })
-
-    output$qc_agg_count_plot <- renderPlot({
-      ad <- qc_agg_data()
-      validate(need(nrow(ad) > 0, "Geen data beschikbaar."))
-      ggplot(ad, aes(x = period, y = N)) +
-        geom_col() +
-        labs(
-          title = sprintf("Aantal stalen per %s", switch(input$qc_agg, day = "dag", month = "maand", year = "jaar")),
-          x = "Periode", y = "Aantal"
-        ) +
-        theme_minimal()
-    })
-
-    output$qc_agg_volume_plot <- renderPlot({
-      ad <- qc_agg_data()
-      validate(need(nrow(ad) > 0, "Geen data beschikbaar."))
-      ggplot(ad, aes(x = period, y = Median)) +
-        geom_line() +
-        geom_point() +
-        geom_ribbon(aes(ymin = P10, ymax = P90), alpha = 0.15) +
-        geom_hline(yintercept = 2, linetype = "dashed") +
-        labs(
-          title = sprintf("Mediaan volume per %s (P10–P90)", switch(input$qc_agg, day = "dag", month = "maand", year = "jaar")),
-          x = "Periode", y = "Volume (mL)"
-        ) +
-        theme_minimal()
-    })
-
-    output$qc_agg_tbl <- renderDT({
-      ad <- qc_agg_data()
-      datatable(ad, options = list(pageLength = 20, scrollX = TRUE))
-    })
-
-    output$qc_per_sample_tbl <- renderDT({
-      df <- qc_filtered()
-      if (!nrow(df)) df <- tibble()
-      keep <- c("province", "zone", "structure_sanitaire", "unite_mobile", "numero", "code_barres_kps", "date_prelev", "date_rec_cpltha",
-                "date_env_cpltha", "date_env_inrb", "volume_ml", "volume_num", "file_date", "source_file", "flag")
-      datatable(df |>
-                  select(any_of(keep)) |>
-                  arrange(date_prelev, zone, numero),
-                options = list(pageLength = 20, scrollX = TRUE), filter = "top")
-    })
-
-    output$qc_out_tbl <- renderDT({
-      df <- qc_filtered()
-      if (!nrow(df) || !"volume_num" %in% names(df)) df <- tibble()
-      else {
-        rng <- input$qc_rng
-        df <- df |>
-          filter(!is.na(volume_num) & (volume_num < rng[1] | volume_num > rng[2])) |>
-          arrange(volume_num) |>
-          mutate(reason = ifelse(volume_num < rng[1], "Low volume", "High volume")) # Reason column for QC outliers
-      }
-      keep <- c("province", "zone", "structure_sanitaire", "unite_mobile", "numero", "code_barres_kps", "volume_ml", "volume_num", "date_prelev", "file_date", "source_file", "reason")
-      datatable(df |> select(any_of(keep)), options = list(pageLength = 20, scrollX = TRUE))
-    })
-
-    output$qc_dup_tbl <- renderDT({
-      flagged <- qc_flagged_data()$flagged
-      if (is.null(flagged) || !nrow(flagged) || !"flag" %in% names(flagged)) {
-        flagged <- tibble()
-      } else {
-        flagged <- flagged |> filter(flag != "OK")
-      }
-      keep <- c("flag", "province", "zone", "structure_sanitaire", "unite_mobile", "numero", "code_barres_kps", "volume_ml", "volume_num", "date_prelev", "file_date", "source_file")
-      datatable(flagged |> select(any_of(keep)), options = list(pageLength = 20, scrollX = TRUE))
-    })
-
-    output$qc_dl_zone <- downloadHandler(
-      filename = function() paste0("zone_summary_", Sys.Date(), ".csv"),
-      content = function(file){
-        df <- qc_filtered()
-        if (!nrow(df) || !all(c("province", "zone", "volume_num") %in% names(df))) {
-          readr::write_csv(tibble(), file)
-          return()
-        }
-        rng <- input$qc_rng
-        summ <- df |>
-          group_by(province, zone) |>
-          summarise(
-            N = dplyr::n(),
-            Out = sum(!is.na(volume_num) & (volume_num < rng[1] | volume_num > rng[2])),
-            `% Out` = round(100 * Out / pmax(N, 1), 1),
-            Median = round(stats::median(volume_num, na.rm = TRUE), 2),
-            P10 = round(stats::quantile(volume_num, 0.10, na.rm = TRUE, names = FALSE), 2),
-            P90 = round(stats::quantile(volume_num, 0.90, na.rm = TRUE, names = FALSE), 2),
-            .groups = "drop"
-          )
-        readr::write_csv(summ, file)
-      }
-    )
-
-    output$qc_dl_out <- downloadHandler(
-      filename = function() paste0("outliers_", Sys.Date(), ".csv"),
-      content = function(file){
-        df <- qc_filtered()
-        if (!nrow(df) || !"volume_num" %in% names(df)) {
-          readr::write_csv(tibble(), file)
-          return()
-        }
-        rng <- input$qc_rng
-        out <- df |>
-          filter(!is.na(volume_num) & (volume_num < rng[1] | volume_num > rng[2])) |>
-          mutate(reason = ifelse(volume_num < rng[1], "Low volume", "High volume"))
-        readr::write_csv(out, file)
-      }
-    )
-
-    output$qc_dl_dup <- downloadHandler(
-      filename = function() paste0("duplicates_", Sys.Date(), ".csv"),
-      content = function(file){
-        flagged <- qc_flagged_data()$flagged
-        if (is.null(flagged) || !nrow(flagged)) {
-          readr::write_csv(tibble(), file)
-          return()
-        }
-        readr::write_csv(flagged |> filter(flag != "OK"), file)
-      }
-    )
-
-    output$qc_dl_filt <- downloadHandler(
-      filename = function() paste0("filtered_", Sys.Date(), ".csv"),
-      content = function(file){
-        df <- qc_filtered()
-        if (!nrow(df)) df <- tibble()
-        readr::write_csv(df, file)
-      }
-    )
-
-    output$qc_dl_agg <- downloadHandler(
-      filename = function() paste0("tijdreeks_", input$qc_agg, "_", Sys.Date(), ".csv"),
-      content = function(file){
-        readr::write_csv(qc_agg_data(), file)
-      }
-    )
-
-    list(
-      qc_dir_input = reactive(input$qc_dir)
-    )
-  })
-}
-
-# -----------------------------------------------------------------------------
-# 2) Plots
-# -----------------------------------------------------------------------------
-plot_zone_pyramids <- function(df, bin = 5, min_n_per_zone = 15, split_study = FALSE){
-  need <- c("age_num","sex_clean","date_prelev","zone","province")
-  if (!all(need %in% names(df))) return(ggplot() + theme_void() + ggtitle("Vereiste kolommen ontbreken"))
-
-  dd <- df |>
-    filter(!is.na(age_num), !is.na(sex_clean), !is.na(date_prelev)) |>
-    make_age_bands(bin = bin) |>
-    count(province, zone, age_band, sex_clean, study, name = "n") |>
-    complete(province, zone, age_band, sex_clean, study, fill = list(n = 0))
-
-  if (!nrow(dd)) return(ggplot() + theme_void() + ggtitle("Geen data na filter"))
-
-  zone_tot <- dd |>
-    group_by(province, zone) |>
-    summarise(N = sum(n), .groups = "drop") |>
-    filter(N >= min_n_per_zone)
-  if (!nrow(zone_tot)) return(ggplot() + theme_void() + ggtitle("Geen zones met voldoende N"))
-
-  dd <- dd |>
-    semi_join(zone_tot, by = c("province","zone")) |>
-    mutate(n_signed = if_else(sex_clean == "M", -n, n))
-
-  p <- ggplot(dd, aes(x = n_signed, y = age_band, fill = sex_clean)) +
-    geom_col(width = 0.9, colour = "grey40") +
-    geom_vline(xintercept = 0, colour = "grey30") +
-    scale_x_continuous("Aantal (links = M, rechts = F)", labels = abs) +
-    scale_y_discrete("Leeftijdsband") +
-    guides(fill = guide_legend(title = "Geslacht")) +
-    theme_minimal(base_size = 12)
-
-  if (split_study) p + facet_grid(study + province ~ zone, scales = "free_x", space = "free_x")
-  else p + facet_grid(province ~ zone, scales = "free_x", space = "free_x")
-}
-
-plot_age_sex_pyramid_plus <- function(df, facet_by = c("zone","province"), bin = 5, split_study = FALSE){
-  facet_by <- rlang::arg_match(facet_by)
-  need <- c("age_num","sex_clean", facet_by)
-  if (!all(need %in% names(df))) return(ggplot() + theme_void() + ggtitle("Vereiste kolommen ontbreken"))
-
-  dd <- df |>
-    filter(!is.na(age_num), !is.na(sex_clean), !is.na(date_prelev)) |>
-    make_age_bands(bin = bin) |>
-    count(.data[[facet_by]], age_band, sex_clean, study, name = "n") |>
-    complete(.data[[facet_by]], age_band, sex_clean, study, fill = list(n = 0)) |>
-    mutate(n_signed = if_else(sex_clean == "M", -n, n))
-
-  if (!nrow(dd)) return(ggplot() + theme_void() + ggtitle("Geen data na filter"))
-
-  p <- ggplot(dd, aes(x = n_signed, y = age_band, fill = sex_clean)) +
-    geom_col(width = .9, colour = "grey40") +
-    geom_vline(xintercept = 0, colour = "grey30") +
-    scale_x_continuous("Aantal (links = M, rechts = F)", labels = abs) +
-    scale_y_discrete("Leeftijdsband") +
-    guides(fill = guide_legend(title = "Geslacht")) +
-    theme_minimal(base_size = 12)
-
-  if (split_study) p + facet_wrap(vars(study, .data[[facet_by]]))
-  else p + facet_wrap(vars(.data[[facet_by]]))
-}
-
-# -----------------------------------------------------------------------------
-# 3) UI
-# -----------------------------------------------------------------------------
-ui <- page_fluid(
-  theme = bs_theme(version = 5, bootswatch = "flatly"),
-  tags$head(tags$style(HTML(".summary-card-label {text-transform: uppercase; font-size: 0.75rem; letter-spacing: 0.05em; color: #6c757d;}\n.summary-card-value {font-size: 2rem; font-weight: 600;}\n.summary-card .card-body {display: flex; flex-direction: column; gap: 0.15rem;}\n.map-card .card-header {display: flex; justify-content: space-between; align-items: center;}\n.map-card .card-header .btn {font-size: 0.85rem;}\n.mobile-unit-item {border-bottom: 1px solid #e9ecef; padding: 0.35rem 0;}\n.mobile-unit-item:last-child {border-bottom: none;}"))),
-  fluidRow(
-    column(
-      width = 3,
-      card(
-        card_header("Bron & bestand"),
-        helpText("Selecteer de biobank-map, kies een Excelbestand en laad de data."),
-        textInput("root", "Biobank-map", value = "C:/Users/nvanreet/ITG/THA - Digital Management System - CRT Dipumba Upload - CRT Dipumba Upload/01 - Biobanque"),
-        uiOutput("filepick_ui"),
-        actionButton("refresh", "Vernieuwen"),
-        div(class = "mt-2", strong("Bestand:"), textOutput("used_file", inline = TRUE))
-      ),
-      card(
-        card_header("Kaartinstellingen"),
-        checkboxInput("use_grid3", "Gebruik GRID3-gezondheidszones (internet)", value = FALSE),
-        uiOutput("grid3_status"),
-        fileInput(
-          "zones_geo",
-          "Gezondheidszones (GeoJSON/Shape/.zip of RDS)",
-          accept = c(".geojson", ".json", ".shp", ".zip", ".gpkg", ".rds"),
-          buttonLabel = "Kies bestand"
-        ),
-        selectInput("zones_name_col", "Kolom met ZS-naam (in kaartlaag)", choices = NULL),
-        selectInput("prov_name_col",  "Kolom met provincienaam (in kaartlaag)", choices = NULL),
-        selectInput(
-          "map_metric_zs", "Kleurmetriek",
-          choices = c(
-            "Aantal stalen" = "n",
-            "DA-stalen" = "n_da",
-            "DP-stalen" = "n_dp",
-            "% vrouw" = "pct_f",
-            "% DA" = "pct_da",
-            "% DP" = "pct_dp",
-            "Mediaan leeftijd" = "med_age"
-          ),
-          selected = "n"
-        ),
-        numericInput("map_bins_zs", "Kleur-bins", value = 5, min = 3, max = 9),
-        checkboxInput("outline_by_prov", "Contour in kleur per provincie (Kasai-Oriental geel, Lomami rood)", value = TRUE),
-        actionButton("focus_kasai", "Focus Kasai-Oriental + Lomami")
-      ),
-      card(
-        card_header("Filters"),
-        dateRangeInput("daterng", "Datumbereik (date_prelev)", start = Sys.Date() - 180, end = Sys.Date()),
-        selectInput("study", "Filter studie", choices = c("Alle"), selected = "Alle"),
-        uiOutput("province_ui"),
-        uiOutput("zone_ui"),
-        uiOutput("structure_ui"),
-        uiOutput("mobile_ui"),
-        checkboxGroupInput("sex", "Geslacht", choices = c("M", "F"), selected = c("M", "F"), inline = TRUE),
-        sliderInput("age_rng", "Leeftijd", min = 0, max = 110, value = c(0, 80))
-      ),
-      card(
-        card_header("Age & sex-instellingen"),
-        numericInput("bin", "Leeftijdsband (jaar)", value = 5, min = 1, step = 1),
-        numericInput("minN", "Min. N per zone (filter)", value = 15, min = 1, step = 1),
-        checkboxInput("split_study", "Onderverdeel per studie (DA/DP)", value = FALSE),
-        selectInput("facet", "Facet voor ‘Plus’ grafiek", choices = c("zone", "province"), selected = "zone"),
-        checkboxInput("p_interactive", "Interactief", value = FALSE)
-      ),
-      card(
-        card_header("Downloads"),
-        downloadButton("dl_csv", "Download CSV"),
-        downloadButton("dl_plot", "Download plot (PNG)"),
-        downloadButton("dl_plot_pdf", "Download plot (PDF)")
-      )
-    ),
-    column(
-      width = 6,
-      card(
-        class = "map-card",
-        card_header(
-          div("Gezondheidszones & mobiele units"),
-          div(
-            class = "d-flex gap-2",
-            actionButton("focus_kasai_top", "Kasai & Lomami", class = "btn btn-sm btn-outline-secondary"),
-            actionButton("reset_map", "Reset", class = "btn btn-sm btn-outline-secondary")
-          )
-        ),
-        div(class = "text-muted small mb-2", "Hover over een zone voor DA/DP, markers tonen mobiele units."),
-        uiOutput("empty_banner"),
-        withSpinner(leafletOutput("map_zones", height = "70vh"))
-      )
-    ),
-    column(
-      width = 3,
-      card(
-        card_header("Selectie-overzicht"),
-        uiOutput("summary_cards")
-      ),
-      card(
-        card_header("Zone detail"),
-        uiOutput("zone_detail_select_ui"),
-        uiOutput("zone_detail_panel")
-      ),
-      card(
-        card_header("Mobiele units"),
-        uiOutput("mobile_units_panel")
-      )
-    )
-  ),
-  fluidRow(
-    column(
-      width = 12,
-      navset_card_pill(
-        nav_panel(
-          "Age & sex-piramides",
-          card(
-            card_body(
-              uiOutput("p_zone_container")
-            )
-          )
-        ),
-        nav_panel(
-          "Plus-grafiek",
-          card(
-            card_body(
-              uiOutput("p_plus_container")
-            )
-          )
-        ),
-        nav_panel(
-          "Doorlooptijden",
-          card(
-            card_body(
-              uiOutput("doorlooptijd_cards"),
-              fluidRow(
-                column(6, withSpinner(plotOutput("p_trans_time", height = 350))),
-                column(6, withSpinner(plotOutput("p_trans_dist", height = 350)))
-              ),
-              withSpinner(plotOutput("p_trans_box", height = 320)),
-              withSpinner(plotOutput("p_trans_flag", height = 250))
-            )
-          )
-        ),
-        nav_panel(
-          "Data",
-          card(card_body(withSpinner(DTOutput("tbl"))))
-        ),
-        nav_panel(
-          "Diagnose",
-          card(
-            card_body(
-              fluidRow(
-                column(6, h5("Kolomnamen (origineel)"), verbatimTextOutput("cols_raw")),
-                column(6, h5("Kolomnamen (na mapping)"), verbatimTextOutput("cols_map"))
-              ),
-              hr(),
-              fluidRow(
-                column(6, h5("Datumbereik in data"), verbatimTextOutput("range_dates")),
-                column(6, h5("Unieke waarden"), verbatimTextOutput("uniques"))
-              )
-            )
-          )
-        ),
-        nav_panel(
-          "Extraction QC",
-          card(card_body(qcUI("qc")))
-        )
-      )
+      width = 8,
+      leafletOutput("map", height = "80vh")
     )
   )
 )
@@ -2031,249 +1110,45 @@ server <- function(input, output, session){
       has_coords = logical()
     )
 
-    df <- filtered(); if (is.null(df) || !nrow(df)) return(empty_units)
+server <- function(input, output, session){
+  hz <- load_health_zones()
 
-    lat_col <- find_first_matching_column(df, c("latitude", "lat", "gps_lat", "lat_dd", "latitude_decimal", "coord_y", "y_coord"))
-    lon_col <- find_first_matching_column(df, c("longitude", "lon", "gps_lon", "lon_dd", "longitude_decimal", "coord_x", "x_coord"))
-
-    lat <- if (!is.null(lat_col)) suppressWarnings(readr::parse_number(df[[lat_col]])) else rep(NA_real_, nrow(df))
-    lon <- if (!is.null(lon_col)) suppressWarnings(readr::parse_number(df[[lon_col]])) else rep(NA_real_, nrow(df))
-
-    df_valid <- df
-
-    unit_col <- NULL
-    if ("unite_mobile" %in% names(df_valid)) {
-      unit_col <- "unite_mobile"
+  biobank_data <- reactive({
+    file <- input$upload
+    if (!is.null(file)) {
+      load_biobank(file$datapath, original_name = file$name)
     } else {
-      unit_col <- find_first_matching_column(df_valid, c("mobile", "unite", "unit", "site", "facility", "centre"))
-    }
-    unit_raw <- if (!is.null(unit_col)) df_valid[[unit_col]] else df_valid$zone
-    unit_clean <- stringr::str_trim(as.character(unit_raw))
-
-    zone_name <- stringr::str_trim(as.character(df_valid$zone))
-    province_name <- stringr::str_trim(as.character(df_valid$province))
-    last_sample_num <- suppressWarnings(as.numeric(df_valid$date_prelev))
-
-    units_tbl <- tibble(
-      unit = unit_clean,
-      zone_name = zone_name,
-      province_name = province_name,
-      zone_label = dplyr::case_when(
-        !is.na(zone_name) & zone_name != "" & !is.na(province_name) & province_name != "" ~ paste0(zone_name, " · ", province_name),
-        !is.na(zone_name) & zone_name != "" ~ zone_name,
-        !is.na(province_name) & province_name != "" ~ province_name,
-        TRUE ~ NA_character_
-      ),
-      lat = lat,
-      lon = lon,
-      study = df_valid$study,
-      last_sample_num = last_sample_num
-    ) |>
-      mutate(
-        unit = dplyr::coalesce(dplyr::na_if(unit, ""), "Mobiele unit onbekend"),
-        zone_label = dplyr::coalesce(dplyr::na_if(zone_label, ""), "Zone onbekend"),
-        zone_key = dplyr::na_if(normalize_names(zone_name), ""),
-        prov_key = dplyr::na_if(normalize_names(province_name), "")
-      ) |>
-      group_by(unit, zone_label, zone_key, prov_key) |>
-      summarise(
-        lat = suppressWarnings(mean(lat, na.rm = TRUE)),
-        lon = suppressWarnings(mean(lon, na.rm = TRUE)),
-        n = dplyr::n(),
-        n_da = sum(toupper(study) == "DA", na.rm = TRUE),
-        n_dp = sum(toupper(study) == "DP", na.rm = TRUE),
-        last_sample = suppressWarnings(max(last_sample_num, na.rm = TRUE)),
-        .groups = "drop"
-      ) |>
-      mutate(
-        lat = ifelse(is.finite(lat), lat, NA_real_),
-        lon = ifelse(is.finite(lon), lon, NA_real_),
-        n_da = dplyr::coalesce(as.integer(n_da), 0L),
-        n_dp = dplyr::coalesce(as.integer(n_dp), 0L),
-        last_sample = dplyr::if_else(
-          is.finite(last_sample),
-          as.Date(last_sample, origin = "1970-01-01"),
-          as.Date(NA)
-        ),
-        has_coords = is.finite(lat) & is.finite(lon)
-      )
-
-    if (!all(units_tbl$has_coords, na.rm = TRUE)) {
-      zones <- zones_sf()
-      if (!is.null(zones) && inherits(zones, "sf")) {
-        zone_col <- input$zones_name_col
-        prov_col <- input$prov_name_col
-
-        if (is.character(zone_col) && nzchar(zone_col) && zone_col %in% names(zones) &&
-            is.character(prov_col) && nzchar(prov_col) && prov_col %in% names(zones)) {
-
-          zones$zone_key <- dplyr::na_if(normalize_names(as.character(zones[[zone_col]])), "")
-          zones$prov_key <- dplyr::na_if(normalize_names(as.character(zones[[prov_col]])), "")
-          zones_points <- suppressWarnings(sf::st_point_on_surface(zones))
-          coords <- suppressWarnings(sf::st_coordinates(zones_points))
-
-          if (nrow(coords)) {
-            lat_idx <- if ("Y" %in% colnames(coords)) "Y" else 2
-            lon_idx <- if ("X" %in% colnames(coords)) "X" else 1
-            zones_lookup <- tibble(
-              zone_key = zones$zone_key,
-              prov_key = zones$prov_key,
-              lat_zone = coords[, lat_idx],
-              lon_zone = coords[, lon_idx]
-            )
-
-            units_tbl <- units_tbl |>
-              left_join(zones_lookup, by = c("zone_key", "prov_key")) |>
-              mutate(
-                lat = dplyr::if_else(has_coords, lat, lat_zone),
-                lon = dplyr::if_else(has_coords, lon, lon_zone),
-                has_coords = is.finite(lat) & is.finite(lon)
-              ) |>
-              select(-lat_zone, -lon_zone)
-          }
-        }
-      }
-    }
-
-    units_tbl |>
-      arrange(desc(n))
-  })
-  observeEvent(input$map_zones_shape_mouseover, {
-    ev <- input$map_zones_shape_mouseover
-    if (!is.null(ev$id)) zone_hover_id(ev$id)
-  })
-
-  observeEvent(input$map_zones_shape_mouseout, {
-    zone_hover_id(NULL)
-  })
-
-  observeEvent(input$map_zones_shape_click, {
-    ev <- input$map_zones_shape_click
-    if (is.null(ev$id)) return()
-    zone_hover_id(ev$id)
-    s <- zone_summary()
-    if (!is.null(s) && nrow(s) && ev$id %in% s$zone_uid && !is.null(input$zone_detail_select)) {
-      updateSelectInput(session, "zone_detail_select", selected = ev$id)
+      load_biobank()
     }
   })
 
-  zone_focus_id <- reactive({
-    sel <- input$zone_detail_select
-    if (!is.null(sel) && sel != "ALL") return(sel)
-    hz <- zone_hover_id()
-    if (!is.null(hz)) return(hz)
-    "ALL"
+  summary_data <- reactive({
+    dat <- biobank_data()
+    biobank_summary(dat$data)
   })
 
-  zone_detail_data <- reactive({
-    df <- filtered(); if (is.null(df) || !nrow(df)) return(NULL)
-    s <- zone_summary()
-    focus <- zone_focus_id()
-
-    build_info <- function(total, n_da, n_dp, pct_f, med_age, last_sample, label, subtitle = NULL, pct_da = NA_real_, pct_dp = NA_real_, source = "overall"){
-      if (!inherits(last_sample, "Date")) {
-        if (!is.null(last_sample) && length(last_sample) && is.finite(last_sample)) {
-          last_sample <- as.Date(last_sample, origin = "1970-01-01")
-        } else {
-          last_sample <- as.Date(NA)
-        }
-      }
-      if (!is.finite(med_age)) med_age <- NA_real_
-      list(
-        title = label,
-        subtitle = subtitle,
-        total = total,
-        n_da = n_da,
-        n_dp = n_dp,
-        pct_f = pct_f,
-        pct_da = pct_da,
-        pct_dp = pct_dp,
-        med_age = med_age,
-        last_sample = last_sample,
-        source = source
-      )
-    }
-
-    if (!is.null(s) && nrow(s) && !is.null(focus) && focus != "ALL") {
-      row <- s |> filter(zone_uid == focus)
-      if (nrow(row)) {
-        label <- dplyr::coalesce(row$zone, "Onbekende zone")
-        subtitle <- dplyr::coalesce(row$province, NA_character_)
-        return(build_info(row$n, row$n_da, row$n_dp, row$pct_f, row$med_age, row$last_sample, label, subtitle, row$pct_da, row$pct_dp, source = "zone"))
-      }
-    }
-
-    n_all <- nrow(df)
-    n_da <- sum(toupper(df$study) == "DA", na.rm = TRUE)
-    n_dp <- sum(toupper(df$study) == "DP", na.rm = TRUE)
-    n_f  <- sum(df$sex_clean == "F", na.rm = TRUE)
-    pct_f <- ifelse(n_all > 0, round(100 * n_f / n_all, 1), NA_real_)
-    pct_da <- ifelse(n_all > 0, round(100 * n_da / n_all, 1), NA_real_)
-    pct_dp <- ifelse(n_all > 0, round(100 * n_dp / n_all, 1), NA_real_)
-    med_age <- suppressWarnings(stats::median(df$age_num, na.rm = TRUE))
-    last_sample <- suppressWarnings(max(df$date_prelev, na.rm = TRUE))
-    build_info(n_all, n_da, n_dp, pct_f, med_age, last_sample, "Alle zones", source = "overall", pct_da = pct_da, pct_dp = pct_dp)
+  totals_by_province <- reactive({
+    summary_data() |>
+      group_by(prov_key, province) |>
+      summarise(total_records = sum(records), .groups = "drop")
   })
 
-  output$zone_detail_select_ui <- renderUI({
-    s <- zone_summary()
-    if (is.null(s) || !nrow(s)) {
-      return(helpText("Laad data en kies een zone om detail te bekijken."))
-    }
-    s <- s |> filter(!is.na(zone_uid))
-    if (!nrow(s)) {
-      return(helpText("Geen zones met sleutel beschikbaar in de kaartlaag."))
-    }
-    labels <- paste0(dplyr::coalesce(s$zone, "Onbekend"), " · ", dplyr::coalesce(s$province, "?"))
-    choices <- setNames(c("ALL", s$zone_uid), c("Alle zones", labels))
-    selected <- isolate(input$zone_detail_select)
-    if (is.null(selected) || !selected %in% choices) selected <- "ALL"
-    selectInput("zone_detail_select", "Zone voor detail", choices = choices, selected = selected)
-  })
-
-  output$zone_detail_panel <- renderUI({
-    info <- zone_detail_data()
-    if (is.null(info)) {
-      return(helpText("Geen data om te tonen."))
-    }
-
-    fmt_int <- function(x) ifelse(is.na(x), "0", formatC(as.integer(x), format = "d", big.mark = " "))
-    fmt_pct <- function(x) ifelse(is.na(x), "–", paste0(scales::number(x, accuracy = 0.1), "%"))
-    fmt_age <- function(x) ifelse(is.na(x), "–", round(as.numeric(x), 1))
-    fmt_date <- function(x) {
-      if (inherits(x, "Date")) {
-        return(ifelse(is.na(x), "–", format(x, "%d %b %Y")))
-      }
-      "–"
-    }
-
-    metrics <- tagList(
-      div(class = "d-flex justify-content-between", span("Totale stalen"), strong(fmt_int(info$total))),
-      div(class = "d-flex justify-content-between", span("DA"), span(sprintf("%s (%s)", fmt_int(info$n_da), fmt_pct(info$pct_da)))),
-      div(class = "d-flex justify-content-between", span("DP"), span(sprintf("%s (%s)", fmt_int(info$n_dp), fmt_pct(info$pct_dp)))),
-      div(class = "d-flex justify-content-between", span("% vrouw"), strong(fmt_pct(info$pct_f))),
-      div(class = "d-flex justify-content-between", span("Mediaan leeftijd"), strong(fmt_age(info$med_age))),
-      div(class = "d-flex justify-content-between", span("Laatste staal"), strong(fmt_date(info$last_sample)))
-    )
-
-    footnote <- if (identical(info$source, "zone")) {
-      tags$small(class = "text-muted d-block mt-2", "Cijfers op basis van huidige selectie voor deze zone.")
+  output$biobank_info <- renderText({
+    dat <- biobank_data()
+    if (isTRUE(dat$sample)) {
+      "Showing built-in sample biobank data."
+    } else if (!is.null(dat$path)) {
+      sprintf("Loaded biobank file: %s", dat$path)
     } else {
-      tags$small(class = "text-muted d-block mt-2", "Hover over een zone of kies er één via het menu om details te zien.")
+      "No biobank file available."
     }
-
-    tagList(
-      tags$h5(class = "mb-1", info$title),
-      if (!is.null(info$subtitle) && !is.na(info$subtitle)) tags$div(class = "text-muted small mb-2", info$subtitle),
-      div(class = "d-flex flex-column gap-1 small", metrics),
-      footnote
-    )
   })
 
-  prov_outline_color <- function(prov_norm){
-    ifelse(prov_norm %in% c("kasai oriental","kasaï oriental"), "#F1C40F",
-           ifelse(prov_norm == "lomami", "#E74C3C", "#555555"))
-  }
+  output$summary_table <- renderTable({
+    df <- summary_data()
+    if (!nrow(df)) return(tibble(province = character(), study = character(), records = integer()))
+    df |> select(province, study, records)
+  }, striped = TRUE, bordered = TRUE, width = "100%")
 
   zones_map_data <- reactive({
     bundle <- zones_bundle()
@@ -2296,29 +1171,17 @@ server <- function(input, output, session){
     gj$zone_uid <- dplyr::coalesce(gj$zone_uid, paste(gj$zone_key, gj$prov_key, sep = "__"))
     gj$layer_id <- gj$zone_uid
 
-    metric <- switch(input$map_metric_zs,
-      n       = gj$n,
-      n_da    = gj$n_da,
-      n_dp    = gj$n_dp,
-      pct_f   = gj$pct_f,
-      pct_da  = gj$pct_da,
-      pct_dp  = gj$pct_dp,
-      med_age = gj$med_age,
-      gj$n
+    zone_lbl <- lapply(
+      sprintf("<b>%s</b><br/>Province: %s<br/>Biobank records: %s",
+              zones$zonesante, zones$province, safe_total(zones$total_records)),
+      htmltools::HTML
     )
-    metric_num <- suppressWarnings(as.numeric(metric))
-    pal <- colorBin("YlGnBu", domain = metric_num, bins = input$map_bins_zs, na.color = "#cccccc")
 
-    legend_lookup <- c(
-      n = "Aantal stalen",
-      n_da = "DA-stalen",
-      n_dp = "DP-stalen",
-      pct_f = "% vrouw",
-      pct_da = "% DA",
-      pct_dp = "% DP",
-      med_age = "Mediaan leeftijd"
+    prov_lbl <- lapply(
+      sprintf("<b>%s</b><br/>Biobank records: %s",
+              provinces$province, safe_total(provinces$total_records)),
+      htmltools::HTML
     )
-    legend_title <- legend_lookup[[input$map_metric_zs]]
 
     provinces <- NULL
     if (!is.null(bundle$provinces) && inherits(bundle$provinces, "sf")) {
@@ -2364,24 +1227,34 @@ server <- function(input, output, session){
     map <- leaflet(gj) |>
       addProviderTiles(providers$CartoDB.Positron) |>
       addPolygons(
-        weight = 1.2, color = border_cols, opacity = 1,
-        fillOpacity = 0.85, fillColor = ~pal(metric),
-        layerId = ~layer_id,
-        label = ~lapply(
-          sprintf(
-            "<b>Zone:</b> %s<br/><b>Provincie:</b> %s<br/><b>Totaal:</b> %s<br/><b>DA:</b> %s<br/><b>DP:</b> %s<br/><b>% vrouw:</b> %s<br/><b>Mediaan leeftijd:</b> %s<br/><b>Laatste staal:</b> %s",
-            ifelse(is.na(gj[[input$zones_name_col]]), "?", gj[[input$zones_name_col]]),
-            ifelse(is.na(gj[[input$prov_name_col]]),  "?", gj[[input$prov_name_col]]),
-            ifelse(is.na(n), 0, fmt_int(n)),
-            ifelse(is.na(n_da), 0, fmt_int(n_da)),
-            ifelse(is.na(n_dp), 0, fmt_int(n_dp)),
-            fmt_pct(pct_f),
-            ifelse(is.na(med_age), "-", round(med_age, 1)),
-            fmt_date(last_sample)
-          ),
-          htmltools::HTML
-        ),
+        data = zones,
+        group = "Health zones",
+        weight = 1,
+        color  = "#666666",
+        fillColor = ~prov_col,
+        fillOpacity = 0.6,
+        label = zone_lbl,
         highlightOptions = highlightOptions(weight = 2, color = "#000000", bringToFront = TRUE)
+      ) %>%
+      addPolylines(
+        data = provinces,
+        group = "Province outlines",
+        weight = 1.5,
+        color = "#111111",
+        opacity = 0.9,
+        label = prov_lbl
+      ) %>%
+      addLegend(
+        position = "bottomright",
+        colors = unname(hz$cols),
+        labels = names(hz$cols),
+        title  = "Province",
+        opacity = 0.9
+      ) %>%
+      addLayersControl(
+        baseGroups = c("OpenStreetMap", "Carto Positron", "Esri Gray"),
+        overlayGroups = c("Health zones", "Province outlines"),
+        options = layersControlOptions(collapsed = FALSE)
       )
 
     provinces <- data$provinces
@@ -2448,120 +1321,8 @@ server <- function(input, output, session){
 
     map
   })
-
-  output$mobile_units_panel <- renderUI({
-    units <- mobile_units()
-    if (is.null(units) || !nrow(units)) {
-      return(helpText("Geen mobiele units met coördinaten binnen de huidige selectie."))
-    }
-
-    fmt_int <- function(x) ifelse(is.na(x), "0", formatC(as.integer(x), format = "d", big.mark = " "))
-    fmt_date <- function(x) {
-      if (inherits(x, "Date")) {
-        return(ifelse(is.na(x), "–", format(x, "%d %b %Y")))
-      }
-      "–"
-    }
-
-    top_units <- head(units, 5)
-    items <- purrr::map(seq_len(nrow(top_units)), function(i){
-      u <- top_units[i, ]
-      tags$div(
-        class = "mobile-unit-item",
-        tags$strong(u$unit),
-        tags$br(),
-        tags$span(class = "text-muted", u$zone_label),
-        tags$br(),
-        tags$small(
-          sprintf("Stalen: %s (DA: %s · DP: %s) · Laatste staal: %s",
-                  fmt_int(u$n), fmt_int(u$n_da), fmt_int(u$n_dp), fmt_date(u$last_sample))
-        )
-      )
-    })
-
-    extras <- if (nrow(units) > 5) {
-      list(tags$small(class = "text-muted", sprintf("+%s extra mobiele units", nrow(units) - 5)))
-    } else list()
-
-    no_coord <- sum(!units$has_coords, na.rm = TRUE)
-    if (no_coord > 0) {
-      extras <- c(extras, list(tags$small(class = "text-muted", sprintf("%s unit(s) zonder coördinaten worden niet op de kaart getoond.", no_coord))))
-    }
-
-    do.call(tagList, c(items, extras))
-  })
-
-  focus_kasai_view <- function(){
-    data <- zones_map_data()
-    req(!is.null(data))
-    gj <- data$gj
-    if (!inherits(gj, "sf")) return()
-    focus <- gj |> dplyr::filter(prov_key %in% c("kasai oriental", "lomami"))
-    req(nrow(focus) > 0)
-    bbox <- sf::st_bbox(focus)
-    leafletProxy("map_zones") |>
-      fitBounds(lng1 = bbox['xmin'], lat1 = bbox['ymin'], lng2 = bbox['xmax'], lat2 = bbox['ymax'])
-  }
-
-  observeEvent(input$focus_kasai, { focus_kasai_view() }, ignoreNULL = TRUE)
-  observeEvent(input$focus_kasai_top, { focus_kasai_view() }, ignoreNULL = TRUE)
-
-  observeEvent(input$reset_map, {
-    data <- zones_map_data()
-    req(!is.null(data))
-    gj <- data$gj
-    if (!inherits(gj, "sf")) return()
-    bbox <- sf::st_bbox(gj)
-    leafletProxy("map_zones") |>
-      fitBounds(lng1 = bbox['xmin'], lat1 = bbox['ymin'], lng2 = bbox['xmax'], lat2 = bbox['ymax'])
-  }, ignoreNULL = TRUE)
-
-
-  output$cols_raw <- renderPrint({
-    df0 <- raw_data(); if (is.null(df0)) return("[geen raw data]")
-    names(df0)
-  })
-
-  output$cols_map <- renderPrint({
-    dfm <- mapped_data(); if (is.null(dfm)) return("[geen mapped data]")
-    names(dfm)
-  })
-
-  output$range_dates <- renderPrint({
-    df <- biobank(); if (is.null(df)) return("[geen data]")
-    range(df$date_prelev, na.rm = TRUE)
-  })
-
-  output$uniques <- renderPrint({
-    df <- biobank(); if (is.null(df)) return("[geen data]")
-    list(
-      study    = sort(unique(na.omit(df$study)))[1:20],
-      province = sort(unique(na.omit(df$province)))[1:20],
-      zone     = sort(unique(na.omit(df$zone)))[1:20]
-    )
-  })
-
-  output$dl_csv <- downloadHandler(
-    filename = function(){ glue("biobank_filtered_{format(Sys.Date(), '%Y%m%d')}.csv") },
-    content  = function(file){ readr::write_csv(filtered(), file) }
-  )
-
-  output$dl_plot <- downloadHandler(
-    filename = function(){ glue("age_sex_pyramids_{format(Sys.Date(), '%Y%m%d')}.png") },
-    content  = function(file){
-      p <- plot_zone_pyramids(filtered(), bin = input$bin, min_n_per_zone = input$minN, split_study = input$split_study)
-      ggsave(file, p, width = 14, height = 9, dpi = 300)
-    }
-  )
-
-  output$dl_plot_pdf <- downloadHandler(
-    filename = function(){ glue("age_sex_pyramids_{format(Sys.Date(), '%Y%m%d')}.pdf") },
-    content  = function(file){
-      p <- plot_zone_pyramids(filtered(), bin = input$bin, min_n_per_zone = input$minN, split_study = input$split_study)
-      ggsave(file, p, width = 14, height = 9, device = grDevices::cairo_pdf) # PDF export using Cairo for crisp text
-    }
-  )
 }
 
+# -------- run ---------------------------------------------------------------
 
 shinyApp(ui, server)
