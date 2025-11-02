@@ -48,10 +48,16 @@ clean_biobank_data <- function(df) {
     rename_first_match("province",  "^province") |>
     rename_first_match("study",     "etude|study|passif|actif|\\bdp\\b|\\bda\\b") |>
     rename_first_match("structure", "structure.*sanit|facility|centre") |>
-    rename_first_match("unit",      "unit[eé].*mobile|mobile.*unit")
+    rename_first_match("unit",      "unit[eé].*mobile|mobile.*unit") |>
+    rename_first_match("date_received_raw", "date.*recept|date.*arriv|recept.*lab|arriv[eé]e") |>
+    rename_first_match("date_result_raw",   "date.*result|result.*date|date.*sortie") |>
+    rename_first_match("doorlooptijd_raw",  "doorloop|turnaround|t\\.?a\\.?t") |>
+    rename_first_match("drs_extract_raw",   "drs.*extract|extract.*drs|date.*drs")
   
   # --- ensure expected columns exist ---
-  needed <- c("barcode","lab_id","date_raw","age","sex","zone","province","study","structure","unit")
+  needed <- c("barcode","lab_id","date_raw","age","sex","zone","province","study",
+              "structure","unit","date_received_raw","date_result_raw",
+              "doorlooptijd_raw","drs_extract_raw")
   for (nm in needed) if (!nm %in% names(df)) df[[nm]] <- NA_character_
   
   # --- date parser that accepts Excel numerics + dmy/ymd/mdy ---
@@ -79,7 +85,10 @@ clean_biobank_data <- function(df) {
   df <- df |>
     mutate(
       date_sample = parse_any_date(date_raw),
-      
+      date_received = parse_any_date(date_received_raw),
+      date_result   = parse_any_date(date_result_raw),
+      date_drs_extract = parse_any_date(drs_extract_raw),
+
       age_num = suppressWarnings(as.numeric(age)),
       age_num = dplyr::case_when(
         is.na(age_num) ~ NA_real_,
@@ -87,7 +96,16 @@ clean_biobank_data <- function(df) {
         dplyr::between(age_num, 0, 110) ~ age_num,
         TRUE ~ NA_real_
       ),
-      
+
+      doorlooptijd_num = suppressWarnings(as.numeric(doorlooptijd_raw)),
+      doorlooptijd_days = dplyr::case_when(
+        !is.na(doorlooptijd_num) ~ doorlooptijd_num,
+        !is.na(date_result) & !is.na(date_sample) ~ as.numeric(difftime(date_result, date_sample, units = "days")),
+        !is.na(date_result) & !is.na(date_received) ~ as.numeric(difftime(date_result, date_received, units = "days")),
+        TRUE ~ NA_real_
+      ),
+      doorlooptijd_days = ifelse(is.finite(doorlooptijd_days), doorlooptijd_days, NA_real_),
+
       sex = toupper(trimws(sex)),
       sex = dplyr::case_when(
         sex %in% c("M","MALE","H") ~ "M",
@@ -109,6 +127,8 @@ clean_biobank_data <- function(df) {
       structure = stringr::str_squish(as.character(structure)),
       unit      = stringr::str_squish(as.character(unit))
     )
+
+  df <- df |> select(-doorlooptijd_num, dplyr::everything())
   
   # --- if no parseable dates, return 0 rows (avoid crashes) ---
   if (all(is.na(df$date_sample))) {
@@ -170,7 +190,7 @@ ui <- page_navbar(
     layout_columns(
       fill = FALSE,
       col_widths = c(3, 3, 3, 3),
-      
+
       value_box(
         title = "Total Samples",
         value = textOutput("vb_total"),
@@ -199,24 +219,57 @@ ui <- page_navbar(
         theme = "warning"
       )
     ),
-    
+
+    layout_columns(
+      fill = FALSE,
+      col_widths = c(6, 6),
+
+      value_box(
+        title = "Median Doorlooptijd",
+        value = textOutput("vb_doorlooptijd"),
+        showcase = bs_icon("stopwatch"),
+        theme = "secondary"
+      ),
+
+      value_box(
+        title = "DRS Extractions",
+        value = textOutput("vb_drs_extract"),
+        showcase = bs_icon("cloud-arrow-down"),
+        theme = "dark"
+      )
+    ),
+
     layout_columns(
       col_widths = c(6, 6),
-      
+
       card(
         card_header("Sample Collection Over Time"),
         plotOutput("plot_timeline", height = 300)
       ),
-      
+
       card(
         card_header("Study Distribution"),
         plotOutput("plot_study_dist", height = 300)
       )
     ),
-    
+
+    layout_columns(
+      col_widths = c(6, 6),
+
+      card(
+        card_header("Doorlooptijd Distribution"),
+        plotOutput("plot_doorlooptijd", height = 300)
+      ),
+
+      card(
+        card_header("DRS Extraction Summary"),
+        tableOutput("table_drs_extract")
+      )
+    ),
+
     layout_columns(
       col_widths = c(4, 4, 4),
-      
+
       card(
         card_header("Demographics Summary"),
         tableOutput("table_demographics")
@@ -454,11 +507,28 @@ server <- function(input, output, session) {
   
   
   output$vb_sites <- renderText({
-    df <- filtered_data()
-    req(df)
-    n_structures <- n_distinct(df$structure[!is.na(df$structure)])
-    n_units <- n_distinct(df$unit[!is.na(df$unit)])
-    sprintf("%s structures\n%s units", n_structures, n_units)
+    df <- filtered_data(); req(df)
+    n_structures <- df |> filter(!is.na(structure)) |> n_distinct(structure)
+    n_units <- df |> filter(!is.na(unit)) |> n_distinct(unit)
+    sprintf("%s structures, %s units", scales::comma(n_structures), scales::comma(n_units))
+  })
+
+  output$vb_doorlooptijd <- renderText({
+    df <- filtered_data(); req(df)
+    tat <- df$doorlooptijd_days
+    tat <- tat[!is.na(tat) & tat >= 0]
+    if (!length(tat)) return("No data")
+    sprintf("%s days", scales::number(stats::median(tat), accuracy = 0.1))
+  })
+
+  output$vb_drs_extract <- renderText({
+    df <- filtered_data(); req(df)
+    drs_dates <- df$date_drs_extract[!is.na(df$date_drs_extract)]
+    if (!length(drs_dates)) return("No data")
+    batches <- dplyr::n_distinct(drs_dates)
+    sprintf("%s samples, %s batches",
+            scales::comma(length(drs_dates)),
+            scales::comma(batches))
   })
   
   # === OVERVIEW PLOTS ===
@@ -494,6 +564,67 @@ server <- function(input, output, session) {
       scale_fill_manual(values = c(DA="#3498DB", DP="#27AE60", Unknown="grey70")) +
       theme_void() + theme(legend.position = "right")
   })
+
+  output$plot_doorlooptijd <- renderPlot({
+    df <- filtered_data(); req(df)
+    df_plot <- df |>
+      filter(!is.na(doorlooptijd_days), doorlooptijd_days >= 0)
+
+    if (!nrow(df_plot)) {
+      return(
+        ggplot() +
+          annotate("text", x = 0, y = 0, label = "No doorlooptijd data", size = 6) +
+          theme_void()
+      )
+    }
+
+    df_plot <- df_plot |>
+      mutate(reference_date = coalesce(date_drs_extract, date_result, date_sample)) |>
+      mutate(period = floor_date(reference_date, "week")) |>
+      filter(!is.na(period)) |>
+      group_by(period) |>
+      summarise(
+        median_days = stats::median(doorlooptijd_days, na.rm = TRUE),
+        n = dplyr::n(),
+        .groups = "drop"
+      )
+
+    if (!nrow(df_plot)) {
+      return(
+        ggplot() +
+          annotate("text", x = 0, y = 0, label = "No dated doorlooptijd records", size = 6) +
+          theme_void()
+      )
+    }
+
+    ggplot(df_plot, aes(period, median_days)) +
+      geom_line(color = "#2C3E50", linewidth = 1) +
+      geom_point(aes(size = n), color = "#3498DB", alpha = 0.8) +
+      scale_y_continuous("Median doorlooptijd (days)") +
+      scale_x_date(NULL) +
+      scale_size_continuous("Samples", range = c(2, 8)) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+  }, res = 96)
+
+  output$table_drs_extract <- renderTable({
+    df <- filtered_data(); req(df)
+    tab <- df |>
+      filter(!is.na(date_drs_extract)) |>
+      mutate(date_drs_extract = as.Date(date_drs_extract)) |>
+      count(date_drs_extract, sort = TRUE)
+
+    if (!nrow(tab)) {
+      return(tibble(Message = "No DRS extraction dates available"))
+    }
+
+    tab |>
+      mutate(
+        date_drs_extract = format(date_drs_extract, "%Y-%m-%d"),
+        n = scales::comma(n)
+      ) |>
+      rename(`Extraction date` = date_drs_extract, Samples = n)
+  }, striped = TRUE, hover = TRUE, bordered = TRUE)
   
   # === SUMMARY TABLES ===
   
@@ -710,7 +841,9 @@ server <- function(input, output, session) {
     req(df)
     
     df |>
-      select(barcode, lab_id, date_sample, study, sex, age_num, 
+      select(barcode, lab_id, date_sample, date_received, date_result,
+             date_drs_extract, doorlooptijd_days,
+             study, sex, age_num,
              province, zone, structure, unit) |>
       datatable(
         options = list(pageLength = 25, scrollX = TRUE),
