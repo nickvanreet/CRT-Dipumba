@@ -16,7 +16,6 @@ suppressPackageStartupMessages({
   library(leaflet)
   library(stringi)
   library(shinycssloaders) # Added for loading spinners
-  library(memoise)         # Added for memoised GRID3 downloads
   library(plotly)          # Added for optional interactive pyramids
 })
 
@@ -25,6 +24,14 @@ options(shiny.maxRequestSize = 200 * 1024^2) # Allow uploads up to ~200 MB for o
 # -----------------------------------------------------------------------------
 # 1) Helpers
 # -----------------------------------------------------------------------------
+keyify <- function(x){
+  x_chr <- as.character(x)
+  x_chr[is.na(x_chr)] <- ""
+  x_chr <- iconv(x_chr, from = "", to = "ASCII//TRANSLIT")
+  x_chr <- tolower(trimws(gsub("[^a-z0-9]+", " ", x_chr)))
+  x_chr
+}
+
 list_excel <- function(dir_biobank){
   if (!dir.exists(dir_biobank)) return(character())
   list.files(dir_biobank, pattern = "\\.xlsx?$", full.names = TRUE)
@@ -327,7 +334,7 @@ make_age_bands <- function(df, bin = 5){
 }
 
 # GRID3 helpers ---------------------------------------------------------------
-read_grid3_health_zones_impl <- function(
+read_grid3_health_zones <- function(
     fields = c("province", "zonesante", "zs_uid"),
     local_paths = NULL
 ){
@@ -423,9 +430,6 @@ read_grid3_health_zones_impl <- function(
        "\nIf blocked, download the file from GRID3’s DRC data page and read locally.")
 }
 
-# Memoise the public download to avoid repeated requests within a session
-read_grid3_health_zones <- memoise::memoise(read_grid3_health_zones_impl)
-
 flatten_grid3_cols <- function(x){
   stopifnot(inherits(x, "sf"))
   geom_col <- attr(x, "sf_column")
@@ -443,6 +447,97 @@ flatten_grid3_cols <- function(x){
     )
   }
   x
+}
+
+prepare_zone_layers <- function(sf_obj, source = NULL){
+  if (is.null(sf_obj) || !inherits(sf_obj, "sf")) return(NULL)
+
+  g <- sf_obj
+  geom_col <- attr(g, "sf_column")
+  if (!identical(geom_col, "geometry")) {
+    names(g)[names(g) == geom_col] <- "geometry"
+    attr(g, "sf_column") <- "geometry"
+  }
+
+  nm_lower <- tolower(names(g))
+  find_col <- function(priority, fallback_pattern){
+    idx <- which(nm_lower %in% priority)
+    if (length(idx)) return(idx[1])
+    if (!is.null(fallback_pattern)) {
+      idx <- which(grepl(fallback_pattern, nm_lower, fixed = FALSE))
+      if (length(idx)) return(idx[1])
+    }
+    NA_integer_
+  }
+
+  prov_idx <- find_col(
+    c("province", "prov", "adm1name", "adm1", "name_1", "adm_1", "adm1_fr"),
+    "prov"
+  )
+  zone_idx <- find_col(
+    c("zonesante", "zone_sante", "zone", "health_zone", "zones", "zs", "zs_name", "name_2", "adm2name", "adm2"),
+    "zone"
+  )
+
+  if (is.na(prov_idx) || is.na(zone_idx)) {
+    stop("Kon kolommen voor provincie en zone niet bepalen in kaartlaag.")
+  }
+
+  prov_col <- names(g)[prov_idx]
+  zone_col <- names(g)[zone_idx]
+
+  g$province <- as.character(g[[prov_col]])
+  g$zonesante <- as.character(g[[zone_col]])
+  g$province[g$province %in% c("", "NA")] <- NA_character_
+  g$zonesante[g$zonesante %in% c("", "NA")] <- NA_character_
+  g$prov_key_default <- keyify(g$province)
+  g$zone_key_default <- keyify(g$zonesante)
+
+  g <- sf::st_make_valid(g)
+  g <- g[!sf::st_is_empty(g), ]
+
+  if (is.na(sf::st_crs(g))) sf::st_crs(g) <- 4326
+  g <- sf::st_transform(g, 4326)
+
+  g3857 <- sf::st_transform(g, 3857)
+  geom_col_3857 <- attr(g3857, "sf_column")
+  if (!identical(geom_col_3857, "geometry")) {
+    names(g3857)[names(g3857) == geom_col_3857] <- "geometry"
+    attr(g3857, "sf_column") <- "geometry"
+  }
+
+  provinces <- g3857 |>
+    dplyr::mutate(
+      province = g$province,
+      prov_key = keyify(province)
+    ) |>
+    dplyr::filter(!is.na(province) & province != "") |>
+    dplyr::group_by(province, prov_key) |>
+    dplyr::summarise(geometry = sf::st_union(geometry), .groups = "drop") |>
+    sf::st_as_sf() |>
+    sf::st_transform(4326) |>
+    sf::st_make_valid()
+
+  provs <- sort(unique(stats::na.omit(g$province)))
+  cols <- character()
+  if (length(provs)) {
+    pal <- RColorBrewer::brewer.pal(min(max(3, min(length(provs), 12)), 12), "Set3")
+    cols <- setNames(rep(pal, length.out = length(provs)), provs)
+    g$prov_col_default <- cols[match(g$province, names(cols))]
+  } else {
+    g$prov_col_default <- NA_character_
+  }
+
+  attr(g, "source_path") <- source
+
+  list(
+    zones = g,
+    provinces = provinces,
+    cols = cols,
+    source = source,
+    province_col = prov_col,
+    zone_col = zone_col
+  )
 }
 
 read_geo_path <- function(path){
@@ -533,16 +628,18 @@ read_default_health_zones_impl <- function(){
 
   for (candidate in candidates) {
     sf_obj <- read_geo_path(candidate)
-    if (!is.null(sf_obj)) {
-      attr(sf_obj, "source_path") <- candidate
-      return(sf_obj)
-    }
+    if (is.null(sf_obj)) next
+    sf_obj <- try(flatten_grid3_cols(sf_obj), silent = TRUE)
+    if (inherits(sf_obj, "try-error")) next
+    bundle <- try(prepare_zone_layers(sf_obj, source = candidate), silent = TRUE)
+    if (inherits(bundle, "try-error") || is.null(bundle)) next
+    return(bundle)
   }
 
   NULL
 }
 
-read_default_health_zones <- memoise::memoise(read_default_health_zones_impl)
+read_default_health_zones <- read_default_health_zones_impl
 
 # QC module -------------------------------------------------------------------
 qcUI <- function(id){
@@ -1272,17 +1369,17 @@ server <- function(input, output, session){
   offline_notice_shown <- reactiveVal(FALSE)
 
   observeEvent(TRUE, {
-    sf_obj <- read_default_health_zones()
-    if (!is.null(sf_obj)) {
-      default_zones_sf(list(
-        sf = sf_obj,
-        source = attr(sf_obj, "source_path")
-      ))
+    bundle <- read_default_health_zones()
+    if (!is.null(bundle)) {
+      default_zones_sf(bundle)
     }
   }, once = TRUE)
 
   observeEvent(TRUE, {
-    paths <- tryCatch(readRDS(cache_file), error = function(e) NULL)
+    paths <- NULL
+    if (file.exists(cache_file)) {
+      paths <- tryCatch(readRDS(cache_file), error = function(e) NULL)
+    }
     if (is.list(paths)) {
       stored_paths(paths)
       if (!is.null(paths$root)) {
@@ -1799,7 +1896,7 @@ server <- function(input, output, session){
   })
 
   # ---------- Gezondheidszones kaart ----------
-  zones_sf <- reactive({
+  zones_bundle <- reactive({
     if (isTRUE(input$use_grid3)) {
       shiny::withProgress(message = "GRID3-zones laden...", value = 0.5, {
         sf <- try(read_grid3_health_zones(), silent = TRUE)
@@ -1807,7 +1904,18 @@ server <- function(input, output, session){
           showNotification("GRID3-zones konden niet geladen worden (mogelijk ontbreekt internet of is toegang geweigerd).", type = "error")
           return(NULL)
         }
-        flatten_grid3_cols(sf)
+        sf <- try(flatten_grid3_cols(sf), silent = TRUE)
+        if (inherits(sf, "try-error")) {
+          showNotification("GRID3-kaartlaag kon niet verwerkt worden.", type = "error")
+          return(NULL)
+        }
+        bundle <- try(prepare_zone_layers(sf, source = "GRID3"), silent = TRUE)
+        if (inherits(bundle, "try-error") || is.null(bundle)) {
+          msg <- if (inherits(bundle, "try-error")) conditionMessage(attr(bundle, "condition")) else "onbekende fout"
+          showNotification(glue::glue("GRID3-kaartlaag kon niet voorbereid worden: {msg}"), type = "error")
+          return(list(zones = sf, provinces = NULL, cols = character(), source = "GRID3"))
+        }
+        bundle
       })
     } else {
       sf <- read_uploaded_geo(input$zones_geo)
@@ -1817,7 +1925,6 @@ server <- function(input, output, session){
           showNotification("Geen offline kaartlaag gevonden. Upload een bestand of gebruik GRID3.", type = "error")
           return(NULL)
         }
-        sf <- offline$sf
         if (!isTRUE(offline_notice_shown())) {
           label <- offline$source
           if (!is.null(label) && nzchar(label)) {
@@ -1828,13 +1935,34 @@ server <- function(input, output, session){
           showNotification(glue::glue("Offline kaartlaag geladen: {label}."), type = "message")
           offline_notice_shown(TRUE)
         }
+        offline
+      } else {
+        sf <- try(flatten_grid3_cols(sf), silent = TRUE)
+        if (inherits(sf, "try-error")) {
+          showNotification("Geüploade kaartlaag kon niet verwerkt worden.", type = "error")
+          return(NULL)
+        }
+        label <- if (!is.null(input$zones_geo$name)) input$zones_geo$name else "upload"
+        bundle <- try(prepare_zone_layers(sf, source = label), silent = TRUE)
+        if (inherits(bundle, "try-error") || is.null(bundle)) {
+          msg <- if (inherits(bundle, "try-error")) conditionMessage(attr(bundle, "condition")) else "onbekende fout"
+          showNotification(glue::glue("Kaartlaag kon niet voorbereid worden: {msg}"), type = "error")
+          return(list(zones = sf, provinces = NULL, cols = character(), source = label))
+        }
+        bundle
       }
-      flatten_grid3_cols(sf)
     }
+  })
+
+  zones_sf <- reactive({
+    bundle <- zones_bundle()
+    if (is.null(bundle)) return(NULL)
+    bundle$zones
   })
 
   observe({
     g <- zones_sf()
+    bundle <- zones_bundle()
     if (is.null(g)) return()
     geom_col <- attr(g, "sf_column")
 
@@ -1845,13 +1973,18 @@ server <- function(input, output, session){
     cand_zone <- intersect(simple_cols, c("zone","zonesante","zs","zs_name","nom_zs","name","NAME","NOM"))
     cand_prov <- intersect(simple_cols, c("province","prov","nom_prov","adm1name","ADM1NAME","NAME_1","name_1"))
 
+    default_zone <- NULL
+    default_prov <- NULL
+    if (!is.null(bundle$zone_col) && bundle$zone_col %in% simple_cols) default_zone <- bundle$zone_col
+    if (!is.null(bundle$province_col) && bundle$province_col %in% simple_cols) default_prov <- bundle$province_col
+
     updateSelectInput(session, "zones_name_col",
       choices  = simple_cols,
-      selected = if (length(cand_zone)) cand_zone[1] else simple_cols[1]
+      selected = if (!is.null(default_zone)) default_zone else if (length(cand_zone)) cand_zone[1] else simple_cols[1]
     )
     updateSelectInput(session, "prov_name_col",
       choices  = simple_cols,
-      selected = if (length(cand_prov)) cand_prov[1] else simple_cols[1]
+      selected = if (!is.null(default_prov)) default_prov else if (length(cand_prov)) cand_prov[1] else simple_cols[1]
     )
   })
 
@@ -2139,16 +2272,23 @@ server <- function(input, output, session){
   }
 
   zones_map_data <- reactive({
+    bundle <- zones_bundle()
     g <- zones_sf()
     s <- zone_summary()
-    if (is.null(g) || is.null(s) || !nrow(s)) return(NULL)
+    if (is.null(bundle) || is.null(g) || is.null(s) || !nrow(s)) return(NULL)
     req(input$zones_name_col, input$prov_name_col)
     g$zone_key <- dplyr::na_if(normalize_names(as.character(g[[input$zones_name_col]])), "")
     g$prov_key <- dplyr::na_if(normalize_names(as.character(g[[input$prov_name_col]])), "")
+    g$zone_display <- dplyr::na_if(as.character(g[[input$zones_name_col]]), "")
+    g$province_display <- dplyr::na_if(as.character(g[[input$prov_name_col]]), "")
     s$zone_key <- dplyr::na_if(normalize_names(as.character(s$zone)), "")
     s$prov_key <- dplyr::na_if(normalize_names(as.character(s$province)), "")
 
+    geom_col <- attr(g, "sf_column")
     gj <- dplyr::left_join(g, s, by = c("zone_key", "prov_key"))
+    if (!inherits(gj, "sf") && !is.null(geom_col) && geom_col %in% names(gj) && inherits(gj[[geom_col]], "sfc")) {
+      gj <- sf::st_as_sf(gj, sf_column_name = geom_col, crs = sf::st_crs(g))
+    }
     gj$zone_uid <- dplyr::coalesce(gj$zone_uid, paste(gj$zone_key, gj$prov_key, sep = "__"))
     gj$layer_id <- gj$zone_uid
 
@@ -2176,7 +2316,18 @@ server <- function(input, output, session){
     )
     legend_title <- legend_lookup[[input$map_metric_zs]]
 
-    list(gj = gj, metric = metric_num, pal = pal, legend_title = legend_title)
+    provinces <- NULL
+    if (!is.null(bundle$provinces) && inherits(bundle$provinces, "sf")) {
+      provinces <- bundle$provinces
+    }
+    list(
+      gj = gj,
+      metric = metric_num,
+      pal = pal,
+      legend_title = legend_title,
+      provinces = provinces,
+      prov_cols = bundle$cols
+    )
   })
 
   output$map_zones <- renderLeaflet({
@@ -2186,7 +2337,17 @@ server <- function(input, output, session){
     metric <- data$metric
     pal <- data$pal
     metric_title <- ifelse(is.null(data$legend_title) || is.na(data$legend_title), "", data$legend_title)
-    border_cols <- if (isTRUE(input$outline_by_prov)) prov_outline_color(gj$prov_key) else "#444444"
+    prov_cols_lookup <- data$prov_cols
+    border_cols <- rep("#444444", nrow(gj))
+    if (isTRUE(input$outline_by_prov)) {
+      if (!is.null(prov_cols_lookup) && length(prov_cols_lookup)) {
+        border_cols <- prov_cols_lookup[match(gj$province_display, names(prov_cols_lookup))]
+        border_cols[is.na(border_cols)] <- prov_outline_color(gj$prov_key[is.na(border_cols)])
+      } else {
+        border_cols <- prov_outline_color(gj$prov_key)
+      }
+    }
+    border_cols[is.na(border_cols)] <- "#444444"
     fmt_int <- function(x) ifelse(is.na(x), "0", formatC(as.integer(x), format = "d", big.mark = " "))
     fmt_pct <- function(x) ifelse(is.na(x), "-", paste0(scales::number(x, accuracy = 0.1), "%"))
     fmt_date <- function(x) {
@@ -2218,6 +2379,28 @@ server <- function(input, output, session){
         ),
         highlightOptions = highlightOptions(weight = 2, color = "#000000", bringToFront = TRUE)
       )
+
+    provinces <- data$provinces
+    if (isTRUE(input$outline_by_prov) && !is.null(provinces) && inherits(provinces, "sf") && nrow(provinces)) {
+      prov_line_cols <- rep("#111111", nrow(provinces))
+      if (!is.null(prov_cols_lookup) && length(prov_cols_lookup)) {
+        prov_line_cols <- prov_cols_lookup[match(provinces$province, names(prov_cols_lookup))]
+      }
+      fallback_idx <- is.na(prov_line_cols)
+      if (any(fallback_idx)) {
+        prov_line_cols[fallback_idx] <- prov_outline_color(provinces$prov_key[fallback_idx])
+      }
+      prov_line_cols[is.na(prov_line_cols)] <- "#111111"
+      map <- map |>
+        addPolylines(
+          data = provinces,
+          color = prov_line_cols,
+          weight = if (is.numeric(input$stroke)) input$stroke + 0.5 else 1.5,
+          opacity = 0.9,
+          group = "Province outlines",
+          label = ~lapply(sprintf("<b>%s</b>", province), htmltools::HTML)
+        )
+    }
 
     units <- mobile_units()
     units_map <- dplyr::filter(units, !is.na(has_coords) & has_coords)
