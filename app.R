@@ -1893,8 +1893,7 @@ server <- function(input, output, session){
         ),
         has_coords = is.finite(lat) & is.finite(lon)
       ) |>
-      {
-        units_tbl <- .
+      (\(units_tbl) {
         if (all(units_tbl$has_coords, na.rm = TRUE)) {
           return(units_tbl)
         }
@@ -1936,7 +1935,7 @@ server <- function(input, output, session){
             has_coords = is.finite(lat) & is.finite(lon)
           ) |>
           select(-lat_zone, -lon_zone)
-      } |>
+      }) |>
       arrange(desc(n))
   })
   observeEvent(input$map_zones_shape_mouseover, {
