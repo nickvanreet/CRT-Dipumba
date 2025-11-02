@@ -177,18 +177,31 @@ read_extractions_dir <- function(dir_extraction) {
       )
   }
 
-  purrr::map_dfr(files, read_one) |>
+  raw <- purrr::map_dfr(files, read_one)
+
+  if (!nrow(raw)) return(tibble())
+
+  n <- nrow(raw)
+
+  get_chr <- function(name) {
+    if (name %in% names(raw)) {
+      as.character(raw[[name]])
+    } else {
+      rep(NA_character_, n)
+    }
+  }
+
+  get_date <- function(name) {
+    parse_any_date(get_chr(name))
+  }
+
+  raw |>
     mutate(
-      date_prelev = if ("date_de_prelevement_jj_mm_aaaa" %in% names(.))
-        parse_any_date(date_de_prelevement_jj_mm_aaaa) else as.Date(NA),
-      date_env_cpltha = if ("date_envoi_vers_cpltha_jj_mm_aaaa" %in% names(.))
-        parse_any_date(date_envoi_vers_cpltha_jj_mm_aaaa) else as.Date(NA),
-      date_rec_cpltha = if ("date_de_reception_cpltha_jj_mm_aaaa" %in% names(.))
-        parse_any_date(date_de_reception_cpltha_jj_mm_aaaa) else as.Date(NA),
-      date_env_inrb = if ("date_denvoi_inrb" %in% names(.))
-        parse_any_date(date_denvoi_inrb) else as.Date(NA),
-      volume_raw = if ("volume_total_echantillon_sang_drs_ml" %in% names(.))
-        volume_total_echantillon_sang_drs_ml else NA_character_,
+      date_prelev = get_date("date_de_prelevement_jj_mm_aaaa"),
+      date_env_cpltha = get_date("date_envoi_vers_cpltha_jj_mm_aaaa"),
+      date_rec_cpltha = get_date("date_de_reception_cpltha_jj_mm_aaaa"),
+      date_env_inrb = get_date("date_denvoi_inrb"),
+      volume_raw = get_chr("volume_total_echantillon_sang_drs_ml"),
       volume_ml = suppressWarnings(as.numeric(volume_raw)),
       volume_ml = ifelse(!is.na(volume_ml) & volume_ml > 10, volume_ml / 10, volume_ml)
     ) |>
