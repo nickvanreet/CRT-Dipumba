@@ -1,4 +1,7 @@
-# app.R — CRT-DIPUMBA / MBUJI-MAYI 
+# app.R — MBUJI-MAYI BIOBANK AGE–SEX (Shiny)
+# -----------------------------------------------------------------------------
+# New: bestandskeuze + diagnose-tab om snel te zien waarom plots leeg zijn.
+# -----------------------------------------------------------------------------
 
 suppressPackageStartupMessages({
   library(shiny)
@@ -108,40 +111,71 @@ parse_any_date <- function(x_chr){
 
 read_extractions_dir <- function(dir_extraction){
   if (!dir.exists(dir_extraction)) return(tibble())
-  
+
   files <- list.files(dir_extraction, pattern = "\\.xlsx?$", full.names = TRUE)
   if (!length(files)) return(tibble())
-  
-  out <- list()
-  errs <- list()
-  
-  for (f in files) {
+
+  errors <- list()
+
+  read_one <- function(f){
+    sneak <- try(suppressMessages(readxl::read_excel(f, n_max = 1)), silent = TRUE)
+    if (inherits(sneak, "try-error") || is.null(sneak)) {
+      cond <- attr(sneak, "condition")
+      errors[[basename(f)]] <<- if (!is.null(cond)) conditionMessage(cond) else NULL
+      return(tibble())
+    }
+
+    col_types <- rep("text", ncol(sneak))
     dat <- try(
       suppressMessages(
-        readxl::read_excel(f, .name_repair = "minimal") |> janitor::clean_names()
+        readxl::read_excel(f, col_types = col_types, .name_repair = "minimal") |>
+          janitor::clean_names()
       ),
       silent = TRUE
     )
     if (inherits(dat, "try-error") || is.null(dat)) {
-      errs[[basename(f)]] <- "kon niet lezen"
-      next
+      cond <- attr(dat, "condition")
+      errors[[basename(f)]] <<- if (!is.null(cond)) conditionMessage(cond) else NULL
+      return(tibble())
     }
+
     dat <- dat |>
-      mutate(
+      dplyr::mutate(
         source_file = basename(f),
         file_date = {
           m <- stringr::str_match(basename(f), "^(\\d{6})")
           if (!is.na(m[1, 2])) as.Date(m[1, 2], format = "%y%m%d") else as.Date(NA)
         }
       )
-    out[[length(out) + 1]] <- dat
+
+    date_cols <- c(
+      "date_de_prelevement_jj_mm_aaaa",
+      "date_envoi_vers_cpltha_jj_mm_aaaa",
+      "date_de_reception_cpltha_jj_mm_aaaa",
+      "date_denvoi_inrb"
+    )
+    for (dc in date_cols) {
+      if (dc %in% names(dat)) dat[[dc]] <- parse_any_date(dat[[dc]])
+    }
+
+    if ("code_barres_kps" %in% names(dat)) {
+      dat <- dat |>
+        filter(!(is.na(code_barres_kps) | code_barres_kps == ""))
+    }
+    dat
   }
-  
-  res <- dplyr::bind_rows(out)
-  attr(res, "errors") <- errs
-  
-  if (!nrow(res)) return(tibble())
-  
+
+  res <- purrr::map_dfr(files, read_one)
+  if (length(errors)) {
+    keep <- vapply(errors, function(x) {
+      if (is.null(x)) return(FALSE)
+      val <- paste(x, collapse = "")
+      nzchar(val)
+    }, logical(1))
+    errors <- errors[keep]
+  }
+  attr(res, "errors") <- errors
+
   res |>
     mutate(
       volume_raw = dplyr::coalesce(
@@ -151,7 +185,7 @@ read_extractions_dir <- function(dir_extraction){
         .data[["volume"]]
       ),
       volume_ml = suppressWarnings(as.numeric(volume_raw)),
-      volume_ml = ifelse(!is.na(volume_ml) && volume_ml > 10, volume_ml / 10, volume_ml)
+      volume_ml = ifelse(!is.na(volume_ml) & volume_ml > 10, volume_ml / 10, volume_ml)
     )
 }
 
@@ -250,23 +284,25 @@ clean_age_sex <- function(df){
       age_num = readr::parse_number(age_text),
       age_num = case_when(
         is.na(age_num) ~ NA_real_,
-        age_num > 1900 & !is.na(date_prelev) ~ lubridate::year(date_prelev) - age_num,
+        age_num > 1900 & !is.na(date_prelev) ~ lubridate::year(date_prelev) - age_num, # Use sample date to compute age
         age_num > 1900 ~ NA_real_,
         TRUE ~ age_num
       ),
       age_num = ifelse(dplyr::between(age_num, 0, 110), age_num, NA_real_),
       sex_clean = recode(toupper(trimws(sex_text)), "M" = "M", "F" = "F", .default = NA_character_),
-      study_raw = study,
-      study_std = study |> as.character() |> stringi::stri_trans_general("Latin-ASCII") |> toupper() |> trimws(),
-      study_std = gsub("[[:punct:]]", " ", study_std),
-      study_std = gsub("\\s+", " ", study_std),
-      study = case_when(
-        study_std %in% c("DA","DIAG ACTIF","DIAGNOSTIC ACTIF","DIAGNOSTIC ACTIVE","DEPISTAGE ACTIF","DEPISTAGE ACTIVE","ACTIVE","MISSION DA") ~ "DA",
-        grepl("DIAG", study_std) & grepl("ACTIF", study_std) ~ "DA",
-        study_std %in% c("DP","DIAG PASSIF","DIAGNOSTIC PASSIF","DEPISTAGE PASSIF","PASSIF") ~ "DP",
-        grepl("PASSIF", study_std) ~ "DP",
-        TRUE ~ study_raw
-      )
+      study = {
+        study_chr <- trimws(as.character(study))
+        study_chr <- ifelse(study_chr %in% c("", "NA", "N/A"), NA_character_, study_chr)
+        study_norm <- stringi::stri_trans_general(toupper(study_chr), "Latin-ASCII")
+        case_when(
+          is.na(study_norm) ~ NA_character_,
+          str_detect(study_norm, "\\bDA\\b") ~ "DA",
+          str_detect(study_norm, "DIAG") & str_detect(study_norm, "ACTIF") ~ "DA",
+          str_detect(study_norm, "\\bDP\\b") ~ "DP",
+          str_detect(study_norm, "DIAG") & str_detect(study_norm, "PASSIF") ~ "DP",
+          TRUE ~ study_chr
+        )
+      }
     )
 }
 
@@ -391,15 +427,6 @@ read_grid3_health_zones_impl <- function(
 read_grid3_health_zones <- memoise::memoise(read_grid3_health_zones_impl)
 
 flatten_grid3_cols <- function(x){
-  if (is.null(x)) return(NULL)
-  
-  # soms zit sf in een lijst of in $data
-  if (is.list(x) && !inherits(x, "sf")) {
-    # pak de eerste sf die je vindt
-    cand <- Filter(function(z) inherits(z, "sf"), x)
-    if (length(cand)) x <- cand[[1]] else return(NULL)
-  }
-  
   stopifnot(inherits(x, "sf"))
   geom_col <- attr(x, "sf_column")
   list_cols <- names(x)[vapply(x, is.list, TRUE)]
@@ -410,7 +437,8 @@ flatten_grid3_cols <- function(x){
       FUN.VALUE = character(1),
       FUN = function(v){
         if (is.null(v) || length(v) == 0) return(NA_character_)
-        paste(as.character(unlist(v, use.names = FALSE)), collapse = "; ")
+        v <- unlist(v, use.names = FALSE)
+        paste(as.character(v), collapse = "; ")
       }
     )
   }
@@ -1720,21 +1748,21 @@ server <- function(input, output, session){
   # ---------- Gezondheidszones kaart ----------
   zones_sf <- reactive({
     if (isTRUE(input$use_grid3)) {
-      sf_obj <- try(read_grid3_health_zones(), silent = TRUE)
-      if (inherits(sf_obj, "try-error") || is.null(sf_obj)) {
-        showNotification("GRID3 kon niet geladen worden. Laad een lokaal bestand.", type = "error")
-        return(NULL)
-      }
-      return(flatten_grid3_cols(sf_obj))
+      shiny::withProgress(message = "GRID3-zones laden...", value = 0.5, {
+        sf <- try(read_grid3_health_zones(), silent = TRUE)
+        if (inherits(sf, "try-error")) {
+          showNotification("GRID3-zones konden niet geladen worden (mogelijk ontbreekt internet of is toegang geweigerd).", type = "error")
+          return(NULL)
+        }
+        flatten_grid3_cols(sf)
+      })
     } else {
-      up <- input$zones_geo
-      if (is.null(up)) return(NULL)
-      sf_obj <- read_uploaded_geo(up)
-      if (is.null(sf_obj) || !inherits(sf_obj, "sf")) {
-        showNotification("Bestand bevat geen geldige kaartlaag (sf).", type = "error")
+      sf <- read_uploaded_geo(input$zones_geo)
+      if (is.null(sf)) {
+        showNotification("Kon kaartlaag niet lezen. Controleer het bestand.", type = "error")
         return(NULL)
       }
-      return(flatten_grid3_cols(sf_obj))
+      flatten_grid3_cols(sf)
     }
   })
 
@@ -1763,25 +1791,26 @@ server <- function(input, output, session){
   zone_summary <- reactive({
     df <- filtered(); if (is.null(df) || !nrow(df)) return(NULL)
     df |>
-      mutate(
-        study_norm = toupper(trimws(study))
-      ) |>
       group_by(zone, province, zone_key, prov_key) |>
       summarise(
-        n      = n(),
-        n_da   = sum(study_norm == "DA", na.rm = TRUE),
-        n_dp   = sum(study_norm == "DP", na.rm = TRUE),
-        n_f    = sum(sex_clean == "F", na.rm = TRUE),
-        pct_f  = ifelse(n > 0, round(100 * n_f / n, 1), NA_real_),
+        n = n(),
+        n_da = sum(toupper(study) == "DA", na.rm = TRUE),
+        n_dp = sum(toupper(study) == "DP", na.rm = TRUE),
+        n_f = sum(sex_clean == "F", na.rm = TRUE),
+        pct_f = ifelse(n > 0, round(100 * n_f / n, 1), NA_real_),
         pct_da = ifelse(n > 0, round(100 * n_da / n, 1), NA_real_),
         pct_dp = ifelse(n > 0, round(100 * n_dp / n, 1), NA_real_),
-        med_age    = suppressWarnings(stats::median(age_num, na.rm = TRUE)),
+        med_age = suppressWarnings(stats::median(age_num, na.rm = TRUE)),
         last_sample = suppressWarnings(max(date_prelev, na.rm = TRUE)),
         .groups = "drop"
       ) |>
       mutate(
         zone_uid = ifelse(is.na(zone_key) & is.na(prov_key), NA_character_, paste(zone_key, prov_key, sep = "__")),
-        last_sample = ifelse(is.finite(last_sample), as.Date(last_sample, origin = "1970-01-01"), as.Date(NA))
+        last_sample = dplyr::if_else(
+          is.finite(last_sample),
+          as.Date(last_sample, origin = "1970-01-01"),
+          as.Date(NA)
+        )
       )
   })
 
@@ -1797,30 +1826,31 @@ server <- function(input, output, session){
       last_sample = as.Date(character()),
       has_coords = logical()
     )
-    
+
     df <- filtered(); if (is.null(df) || !nrow(df)) return(empty_units)
-    
-    lat_col <- find_first_matching_column(df, c("latitude","lat","gps_lat","lat_dd","latitude_decimal","coord_y","y_coord"))
-    lon_col <- find_first_matching_column(df, c("longitude","lon","gps_lon","lon_dd","longitude_decimal","coord_x","x_coord"))
-    
+
+    lat_col <- find_first_matching_column(df, c("latitude", "lat", "gps_lat", "lat_dd", "latitude_decimal", "coord_y", "y_coord"))
+    lon_col <- find_first_matching_column(df, c("longitude", "lon", "gps_lon", "lon_dd", "longitude_decimal", "coord_x", "x_coord"))
+
     lat <- if (!is.null(lat_col)) suppressWarnings(readr::parse_number(df[[lat_col]])) else rep(NA_real_, nrow(df))
     lon <- if (!is.null(lon_col)) suppressWarnings(readr::parse_number(df[[lon_col]])) else rep(NA_real_, nrow(df))
-    
-    # welke kolom = unit?
-    unit_col <- if ("unite_mobile" %in% names(df)) {
-      "unite_mobile"
+
+    df_valid <- df
+
+    unit_col <- NULL
+    if ("unite_mobile" %in% names(df_valid)) {
+      unit_col <- "unite_mobile"
     } else {
-      find_first_matching_column(df, c("mobile","unite","unit","site","facility","centre"))
+      unit_col <- find_first_matching_column(df_valid, c("mobile", "unite", "unit", "site", "facility", "centre"))
     }
-    
-    unit_raw <- if (!is.null(unit_col)) df[[unit_col]] else df$zone
+    unit_raw <- if (!is.null(unit_col)) df_valid[[unit_col]] else df_valid$zone
     unit_clean <- stringr::str_trim(as.character(unit_raw))
-    zone_name <- stringr::str_trim(as.character(df$zone))
-    province_name <- stringr::str_trim(as.character(df$province))
-    last_sample_num <- suppressWarnings(as.numeric(df$date_prelev))
-    
-    # → DIT is nu je basis-tabel
-    units_tbl <- tibble(
+
+    zone_name <- stringr::str_trim(as.character(df_valid$zone))
+    province_name <- stringr::str_trim(as.character(df_valid$province))
+    last_sample_num <- suppressWarnings(as.numeric(df_valid$date_prelev))
+
+    tibble(
       unit = unit_clean,
       zone_name = zone_name,
       province_name = province_name,
@@ -1832,7 +1862,7 @@ server <- function(input, output, session){
       ),
       lat = lat,
       lon = lon,
-      study = df$study,
+      study = df_valid$study,
       last_sample_num = last_sample_num
     ) |>
       mutate(
@@ -1845,7 +1875,7 @@ server <- function(input, output, session){
       summarise(
         lat = suppressWarnings(mean(lat, na.rm = TRUE)),
         lon = suppressWarnings(mean(lon, na.rm = TRUE)),
-        n   = dplyr::n(),
+        n = dplyr::n(),
         n_da = sum(toupper(study) == "DA", na.rm = TRUE),
         n_dp = sum(toupper(study) == "DP", na.rm = TRUE),
         last_sample = suppressWarnings(max(last_sample_num, na.rm = TRUE)),
@@ -1862,57 +1892,53 @@ server <- function(input, output, session){
           as.Date(NA)
         ),
         has_coords = is.finite(lat) & is.finite(lon)
-      )
-    
-    # als alles coördinaten heeft: klaar
-    if (all(units_tbl$has_coords, na.rm = TRUE)) {
-      return(units_tbl |> arrange(desc(n)))
-    }
-    
-    # anders: aanvullen met centroiden uit de kaart
-    zones <- zones_sf()
-    if (is.null(zones) || !inherits(zones, "sf")) {
-      return(units_tbl |> arrange(desc(n)))
-    }
-    
-    zone_col <- input$zones_name_col
-    prov_col <- input$prov_name_col
-    
-    if (!is.character(zone_col) || !nzchar(zone_col) || !zone_col %in% names(zones) ||
-        !is.character(prov_col)  || !nzchar(prov_col)  || !prov_col %in% names(zones)) {
-      return(units_tbl |> arrange(desc(n)))
-    }
-    
-    zones$zone_key <- dplyr::na_if(normalize_names(as.character(zones[[zone_col]])), "")
-    zones$prov_key <- dplyr::na_if(normalize_names(as.character(zones[[prov_col]])), "")
-    zones_points <- suppressWarnings(sf::st_point_on_surface(zones))
-    coords <- suppressWarnings(sf::st_coordinates(zones_points))
-    if (!nrow(coords)) {
-      return(units_tbl |> arrange(desc(n)))
-    }
-    
-    lat_idx <- if ("Y" %in% colnames(coords)) "Y" else 2
-    lon_idx <- if ("X" %in% colnames(coords)) "X" else 1
-    
-    zones_lookup <- tibble(
-      zone_key = zones$zone_key,
-      prov_key = zones$prov_key,
-      lat_zone = coords[, lat_idx],
-      lon_zone = coords[, lon_idx]
-    )
-    
-    units_tbl <- units_tbl |>
-      left_join(zones_lookup, by = c("zone_key", "prov_key")) |>
-      mutate(
-        lat = dplyr::if_else(has_coords, lat, lat_zone),
-        lon = dplyr::if_else(has_coords, lon, lon_zone),
-        has_coords = is.finite(lat) & is.finite(lon)
       ) |>
-      select(-lat_zone, -lon_zone)
-    
-    units_tbl |> arrange(desc(n))
+      {
+        units_tbl <- .
+        if (all(units_tbl$has_coords, na.rm = TRUE)) {
+          return(units_tbl)
+        }
+
+        zones <- zones_sf()
+        if (is.null(zones) || !inherits(zones, "sf")) {
+          return(units_tbl)
+        }
+
+        zone_col <- input$zones_name_col
+        prov_col <- input$prov_name_col
+
+        if (!is.character(zone_col) || !nzchar(zone_col) || !zone_col %in% names(zones) ||
+            !is.character(prov_col) || !nzchar(prov_col) || !prov_col %in% names(zones)) {
+          return(units_tbl)
+        }
+
+        zones$zone_key <- dplyr::na_if(normalize_names(as.character(zones[[zone_col]])), "")
+        zones$prov_key <- dplyr::na_if(normalize_names(as.character(zones[[prov_col]])), "")
+        zones_points <- suppressWarnings(sf::st_point_on_surface(zones))
+        coords <- suppressWarnings(sf::st_coordinates(zones_points))
+        if (!nrow(coords)) {
+          return(units_tbl)
+        }
+        lat_idx <- if ("Y" %in% colnames(coords)) "Y" else 2
+        lon_idx <- if ("X" %in% colnames(coords)) "X" else 1
+        zones_lookup <- tibble(
+          zone_key = zones$zone_key,
+          prov_key = zones$prov_key,
+          lat_zone = coords[, lat_idx],
+          lon_zone = coords[, lon_idx]
+        )
+
+        units_tbl |>
+          left_join(zones_lookup, by = c("zone_key", "prov_key")) |>
+          mutate(
+            lat = dplyr::if_else(has_coords, lat, lat_zone),
+            lon = dplyr::if_else(has_coords, lon, lon_zone),
+            has_coords = is.finite(lat) & is.finite(lon)
+          ) |>
+          select(-lat_zone, -lon_zone)
+      } |>
+      arrange(desc(n))
   })
-  
   observeEvent(input$map_zones_shape_mouseover, {
     ev <- input$map_zones_shape_mouseover
     if (!is.null(ev$id)) zone_hover_id(ev$id)
