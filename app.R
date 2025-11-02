@@ -22,6 +22,16 @@ keyify <- function(x){
   tolower(trimws(gsub("[^a-z0-9]+", " ", x)))
 }
 
+repair_column_names <- function(nms){
+  if (is.null(nms)) return(nms)
+  nms <- as.character(nms)
+  blanks <- which(is.na(nms) | trimws(nms) == "")
+  if (length(blanks)) {
+    nms[blanks] <- paste0("unnamed_", seq_along(blanks))
+  }
+  make.unique(nms, sep = "_")
+}
+
 first_existing <- function(paths){
   paths <- unique(paths)
   paths[file.exists(paths)]
@@ -149,8 +159,8 @@ load_biobank <- function(path = NULL, original_name = NULL){
 
   loader <- function(file_path){
     ext <- tolower(tools::file_ext(file_path))
-    if (ext %in% c("xlsx", "xls")) {
-      readxl::read_excel(file_path, .name_repair = "minimal")
+    df <- if (ext %in% c("xlsx", "xls")) {
+      readxl::read_excel(file_path, .name_repair = repair_column_names)
     } else if (ext == "csv") {
       utils::read.csv(file_path, stringsAsFactors = FALSE, check.names = FALSE)
     } else if (ext %in% c("rds", "rda")) {
@@ -158,6 +168,12 @@ load_biobank <- function(path = NULL, original_name = NULL){
     } else {
       stop(sprintf("Unsupported biobank format: %s", basename(file_path)))
     }
+
+    if (is.data.frame(df)) {
+      names(df) <- repair_column_names(names(df))
+    }
+
+    df
   }
 
   chosen <- NULL
