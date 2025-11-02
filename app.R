@@ -15,6 +15,7 @@ suppressPackageStartupMessages({
   library(stringi)
   library(shinycssloaders)
   library(memoise)
+  library(scales)
 })
 
 options(shiny.maxRequestSize = 200 * 1024^2)
@@ -22,6 +23,23 @@ options(shiny.maxRequestSize = 200 * 1024^2)
 # -----------------------------------------------------------------------------
 # 1) Helpers - FIXED
 # -----------------------------------------------------------------------------
+
+normalize_key <- function(x){
+  x <- as.character(x)
+  x[is.na(x)] <- ""
+  x <- stringi::stri_trans_general(x, "Latin-ASCII")
+  x <- tolower(trimws(x))
+  gsub("[^a-z0-9]+", " ", x) |> trimws()
+}
+
+qstr <- function(x){
+  x <- x[is.finite(x)]
+  if (!length(x)) return("—")
+  sprintf("mediaan %s d (IQR %s–%s)",
+          round(stats::median(x, na.rm = TRUE), 1),
+          round(stats::quantile(x, 0.25, na.rm = TRUE), 1),
+          round(stats::quantile(x, 0.75, na.rm = TRUE), 1))
+}
 
 list_excel <- function(dir_biobank){
   if (!dir.exists(dir_biobank)) return(character())
@@ -53,8 +71,8 @@ read_specific_biobank <- function(file_path){
 # FIXED: More flexible patterns
 rename_by_regex <- function(df){
   patterns <- list(
-    Barcode         = "(code.*barr|barcode)",
-    LabID           = "(numero|num.*ech|lab.*id)",
+    Barcode         = "(code.*barr|barcode|^kps$|code[_ -]*kps)",
+    LabID           = "(numero|num.*ech|lab.*id|^no[_ -]*ech$)",
     date_prelev     = "date.*prelev",
     date_env_cpltha = "date.*envoi.*cpltha",
     date_rec_cpltha = "date.*(reception|recep).*cpltha",
@@ -62,12 +80,13 @@ rename_by_regex <- function(df){
     age_text        = "(age|annee.*naiss)",
     sex_text        = "sexe",
     zone            = "zone.*sante",
-    province        = "province",
+    province        = "province|^prov$|name_1|adm1",
     structure_sanitaire = "structure.*sanit",
     unite_mobile    = "(unite.*mobile|mini.*unite)",
-    temp_field      = "temperature.*transport",
-    temp_cpltha     = "temperature.*stockage",
-    study           = "etude"
+    temp_field      = "temperature.*(transport|terrain|field)",
+    temp_cpltha     = "temperature.*(stockage|cpltha)",
+    study           = "(etude|study)",
+    drs_volume_ml   = "(drs.*vol|volume.*drs|extraction.*vol|vol.*ml|^volume$|^vol$)"
   )
   
   out <- df
@@ -154,50 +173,90 @@ make_age_bands <- function(df, bin = 5){
 
 # Map helpers
 read_grid3_health_zones_impl <- function(fields = c("province", "zonesante", "zs_uid")){
+  load_sf <- function(path){
+    ext <- tolower(tools::file_ext(path))
+    if (ext %in% c("gpkg", "geojson", "json")) {
+      suppressMessages(sf::read_sf(path, quiet = TRUE))
+    } else if (ext %in% c("rds", "rda")) {
+      readRDS(path)
+    } else if (ext == "zip") {
+      tmp <- tempfile()
+      dir.create(tmp)
+      utils::unzip(path, exdir = tmp)
+      shp <- list.files(tmp, pattern = "\\.shp$", full.names = TRUE)
+      if (!length(shp)) stop("Zip archive did not contain a .shp file")
+      suppressMessages(sf::read_sf(shp[1], quiet = TRUE))
+    } else {
+      stop(sprintf("Unsupported map format: %s", basename(path)))
+    }
+  }
+
   normalise_fields <- function(sf_obj) {
+    stopifnot(inherits(sf_obj, "sf"))
+
     nms <- names(sf_obj)
-    if (!"province" %in% nms && "province" %in% tolower(nms)) {
-      names(sf_obj)[which(tolower(nms) == "province")[1]] <- "province"
+    nms_lc <- tolower(nms)
+
+    find_col <- function(patterns) {
+      for (pat in patterns) {
+        hit <- which(grepl(pat, nms_lc, ignore.case = TRUE))
+        if (length(hit)) return(hit[1])
+      }
+      NA_integer_
     }
-    if (!"zonesante" %in% nms && "zonesante" %in% tolower(nms)) {
-      names(sf_obj)[which(tolower(nms) == "zonesante")[1]] <- "zonesante"
+
+    zone_idx <- find_col(c("zone.*sante", "zone.*sante", "zone[_ ]?name", "^zs", "health[_ ]?zone", "adm2", "name_2"))
+    prov_idx <- find_col(c("^province$", "^prov$", "adm1", "name_1", "province", "adm_?1", "^name1$"))
+
+    if (is.na(zone_idx) || is.na(prov_idx)) {
+      stop(sprintf("Could not detect zone/province columns. Found: %s", paste(nms, collapse = ", ")))
     }
+
+    names(sf_obj)[zone_idx] <- "zonesante"
+    names(sf_obj)[prov_idx] <- "province"
+
+    sf_obj <- suppressWarnings(sf::st_make_valid(sf_obj))
+    if (is.na(sf::st_crs(sf_obj))) sf::st_crs(sf_obj) <- 4326
+    sf_obj <- sf::st_transform(sf_obj, 4326)
+    sf_obj <- sf::st_zm(sf_obj, drop = TRUE, what = "ZM")
+
+    geom_col <- attr(sf_obj, "sf_column")
+    list_cols <- setdiff(names(sf_obj)[vapply(sf_obj, is.list, TRUE)], geom_col)
+    for (nm in list_cols) {
+      sf_obj[[nm]] <- vapply(sf_obj[[nm]], function(v){
+        if (is.null(v) || length(v) == 0) return(NA_character_)
+        paste(as.character(unlist(v, use.names = FALSE)), collapse = "; ")
+      }, character(1))
+    }
+
     sf_obj
   }
-  
-  # Try local first
+
   candidates <- c(
     file.path("data", "grid3_health_zones.rds"),
-    file.path("data", "grid3_health_zones.gpkg")
+    file.path("data", "health_zones.rds"),
+    file.path("data", "grid3_health_zones.gpkg"),
+    file.path("data", "health_zones.gpkg"),
+    file.path("data", "grid3_health_zones.geojson"),
+    file.path("data", "health_zones.geojson"),
+    file.path("data", "health_zones_offline.geojson"),
+    file.path("data", "grid3_health_zones.zip"),
+    file.path("data", "health_zones.zip")
   )
-  
+
   for (path in candidates) {
-    if (file.exists(path)) {
-      sf_obj <- try(readRDS(path), silent = TRUE)
-      if (!inherits(sf_obj, "try-error") && inherits(sf_obj, "sf")) {
-        return(normalise_fields(sf_obj))
-      }
-    }
+    if (!file.exists(path)) next
+    sf_obj <- try(load_sf(path), silent = TRUE)
+    if (inherits(sf_obj, "try-error")) next
+    if (inherits(sf_obj, "sf")) return(normalise_fields(sf_obj))
   }
-  
-  stop("Place grid3_health_zones.rds in data/ folder")
+
+  stop("Place a GRID3 health zones file (gpkg/geojson/rds/zip) in data/")
 }
 
 read_grid3_health_zones <- memoise::memoise(read_grid3_health_zones_impl)
 
-flatten_grid3_cols <- function(x){
-  stopifnot(inherits(x, "sf"))
-  geom_col <- attr(x, "sf_column")
-  list_cols <- names(x)[vapply(x, is.list, TRUE)]
-  list_cols <- setdiff(list_cols, geom_col)
-  for (nm in list_cols) {
-    x[[nm]] <- vapply(x[[nm]], FUN.VALUE = character(1), FUN = function(v){
-      if (is.null(v) || length(v) == 0) return(NA_character_)
-      paste(as.character(unlist(v, use.names = FALSE)), collapse = "; ")
-    })
-  }
-  x
-}
+flatten_grid3_cols <- function(x) x
 
 # -----------------------------------------------------------------------------
 # 2) Plots
@@ -310,14 +369,6 @@ ui <- page_fluid(
 
 server <- function(input, output, session){
   
-  normalize_names <- function(x){
-    x <- as.character(x)
-    x[is.na(x)] <- ""
-    x <- stringi::stri_trans_general(x, "Latin-ASCII")
-    x <- tolower(trimws(x))
-    gsub("[\\s_-]+", " ", x)
-  }
-  
   used_file <- reactiveVal("")
   chosen_file <- reactiveVal(NULL)
   biobank_root <- reactiveVal(NULL)
@@ -370,20 +421,24 @@ server <- function(input, output, session){
   biobank <- reactive({
     dfm <- mapped_data()
     if (is.null(dfm)) return(NULL)
-    
+
     df <- dfm |>
       mutate(
         date_prelev = parse_any_date(date_prelev),
+        date_rec_cpltha = parse_any_date(date_rec_cpltha),
+        date_env_cpltha = parse_any_date(date_env_cpltha),
+        date_env_inrb = parse_any_date(date_env_inrb),
         Barcode = as.character(Barcode),
-        LabID = as.character(LabID)
+        LabID = as.character(LabID),
+        drs_volume_ml = suppressWarnings(as.numeric(drs_volume_ml))
       ) |>
       distinct(Barcode, LabID, .keep_all = TRUE) |>
       clean_age_sex() |>
       mutate(
-        prov_key = normalize_names(province),
-        zone_key = normalize_names(zone)
+        prov_key = normalize_key(province),
+        zone_key = normalize_key(zone)
       )
-    
+
     if (!nrow(df)) return(NULL)
     df
   })
@@ -444,22 +499,66 @@ server <- function(input, output, session){
     if (!is.null(input$age_rng) && length(input$age_rng) == 2) {
       df <- df |> filter(is.na(age_num) | dplyr::between(age_num, input$age_rng[1], input$age_rng[2]))
     }
-    
-    df
+
+    df |>
+      mutate(
+        t_prelev_to_cpltha = as.numeric(difftime(date_rec_cpltha, date_prelev, units = "days")),
+        t_prelev_to_inrb   = as.numeric(difftime(date_env_inrb,   date_prelev, units = "days")),
+        t_cpltha_to_inrb   = as.numeric(difftime(date_env_inrb,   date_rec_cpltha, units = "days"))
+      )
   })
   
   output$summary_cards <- renderUI({
     df <- filtered()
     if (is.null(df) || !nrow(df)) return(div(class = "alert alert-warning", "Geen data"))
-    
+
     n_all <- nrow(df)
     n_da <- sum(toupper(df$study) == "DA", na.rm = TRUE)
     n_dp <- sum(toupper(df$study) == "DP", na.rm = TRUE)
-    
-    tagList(
-      div(strong("Totaal: "), scales::comma(n_all)),
-      div(strong("DA: "), scales::comma(n_da), sprintf(" (%.1f%%)", 100*n_da/n_all)),
-      div(strong("DP: "), scales::comma(n_dp), sprintf(" (%.1f%%)", 100*n_dp/n_all))
+    p_f <- mean(df$sex_clean == "F", na.rm = TRUE)
+    if (!is.finite(p_f)) p_f <- NA_real_
+    age_med <- suppressWarnings(stats::median(df$age_num, na.rm = TRUE))
+
+    vol_col <- intersect(names(df), c("drs_volume_ml", "volume_drs", "drs_vol", "extraction_vol_ml", "vol_ml"))
+    qc_txt <- "—"
+    if (length(vol_col)) {
+      v <- suppressWarnings(as.numeric(df[[vol_col[1]]]))
+      within <- mean(v >= 1.7 & v <= 2.3, na.rm = TRUE)
+      if (is.finite(within)) {
+        qc_txt <- sprintf("%.1f%% in 1.7–2.3 mL (n=%s)", 100 * within, sum(is.finite(v)))
+      }
+    }
+
+    da_pct <- if (n_all > 0) 100 * n_da / n_all else NA_real_
+    dp_pct <- if (n_all > 0) 100 * n_dp / n_all else NA_real_
+    da_txt <- if (is.na(da_pct)) sprintf("DA: %s", scales::comma(n_da)) else sprintf("DA: %s (%.1f%%)", scales::comma(n_da), da_pct)
+    dp_txt <- if (is.na(dp_pct)) sprintf("DP: %s", scales::comma(n_dp)) else sprintf("DP: %s (%.1f%%)", scales::comma(n_dp), dp_pct)
+    age_txt <- if (is.finite(age_med)) sprintf("Mediaan leeftijd: %s", round(age_med)) else "Mediaan leeftijd: —"
+
+    layout_column_wrap(
+      width = 1/2,
+      value_box(
+        title = "Stalen",
+        value = scales::comma(n_all),
+        p(da_txt),
+        p(dp_txt)
+      ),
+      value_box(
+        title = "Demografie",
+        value = if (is.na(p_f)) "—" else sprintf("%.1f%% vrouwen", 100 * p_f),
+        p(age_txt)
+      ),
+      value_box(
+        title = "Doorlooptijd",
+        value = qstr(df$t_prelev_to_cpltha),
+        p("Prelev → CPLTHA"),
+        p(glue::glue("Prelev → INRB: {qstr(df$t_prelev_to_inrb)}")),
+        p(glue::glue("CPLTHA → INRB: {qstr(df$t_cpltha_to_inrb)}"))
+      ),
+      value_box(
+        title = "DRS volume QC",
+        value = qc_txt
+      )
     )
   })
   
@@ -488,34 +587,40 @@ server <- function(input, output, session){
     s <- zone_summary()
     
     if (is.null(g)) {
-      return(leaflet() |> 
-        addTiles() |> 
-        addControl("Plaats grid3_health_zones.rds in data/ folder", position = "topright"))
+      return(leaflet() |>
+        addTiles() |>
+        addControl("Plaats GRID3 health_zones bestand (.gpkg/.geojson/.rds) in data/", position = "topright"))
     }
-    
+
     if (is.null(s) || !nrow(s)) {
       return(leaflet(g) |> addTiles() |> addPolygons(fillOpacity = 0.1))
     }
     
-    g$zone_key <- normalize_names(g$zonesante)
-    g$prov_key <- normalize_names(g$province)
-    
+    g$zone_key <- normalize_key(g$zonesante)
+    g$prov_key <- normalize_key(g$province)
+
     gj <- left_join(g, s, by = c("zone_key", "prov_key"))
-    
-    pal <- colorBin("YlGnBu", domain = gj$n, bins = 5, na.color = "#cccccc")
-    
+
+    gj$metric <- gj$n
+    metric <- gj$metric
+    dom <- metric[is.finite(metric)]
+    pal <- colorBin("YlGnBu", domain = if (length(dom)) dom else c(0, 1), bins = 5, na.color = "#cccccc")
+
     leaflet(gj) |>
       addProviderTiles(providers$CartoDB.Positron) |>
       addPolygons(
-        fillColor = ~pal(n), fillOpacity = 0.7,
+        fillColor = ~pal(metric), fillOpacity = 0.7,
         color = "#444", weight = 1,
-        label = ~sprintf("%s: %s DA, %s DP", 
-          zonesante, 
+        label = ~sprintf("%s (%s): N=%s | DA=%s | DP=%s",
+          zonesante,
+          province,
+          ifelse(is.na(n), 0, n),
           ifelse(is.na(n_da), 0, n_da),
           ifelse(is.na(n_dp), 0, n_dp)
-        )
+        ),
+        layerId = ~zonesante
       ) |>
-      addLegend(pal = pal, values = ~n, title = "N stalen")
+      addLegend(pal = pal, values = metric, title = "N stalen")
   })
   
   output$p_zone <- renderPlot({
@@ -528,8 +633,16 @@ server <- function(input, output, session){
   output$tbl <- renderDT({
     df <- filtered()
     if (is.null(df)) df <- tibble()
-    datatable(df |> select(Barcode, LabID, province, zone, study, sex_clean, age_num, date_prelev),
-              options = list(pageLength = 25, scrollX = TRUE))
+    datatable(
+      df |>
+        select(
+          Barcode, LabID, province, zone, study, sex_clean, age_num,
+          date_prelev, date_rec_cpltha, date_env_cpltha, date_env_inrb,
+          t_prelev_to_cpltha, t_prelev_to_inrb, t_cpltha_to_inrb,
+          dplyr::any_of(c("drs_volume_ml"))
+        ),
+      options = list(pageLength = 25, scrollX = TRUE)
+    )
   })
   
   output$cols_raw <- renderPrint({
