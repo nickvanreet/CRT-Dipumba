@@ -173,9 +173,6 @@ normalise_biobank <- function(df){
   )
 }
 
-# Memoise the public download to avoid repeated requests within a session
-read_grid3_health_zones <- memoise::memoise(read_grid3_health_zones_impl)
-
 flatten_grid3_cols <- function(x){
   stopifnot(inherits(x, "sf"))
   geom_col <- attr(x, "sf_column")
