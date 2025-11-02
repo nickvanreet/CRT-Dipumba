@@ -21,32 +21,34 @@ suppressPackageStartupMessages({
 parse_any_date <- function(x) {
   x_chr <- trimws(as.character(x))
   x_chr[x_chr %in% c("", "NA", "N/A", "na", "NaN", "NULL")] <- NA
-
+  
   out <- as.Date(rep(NA_integer_, length(x_chr)), origin = "1970-01-01")
-
-  is_num <- grepl("^\\d+$", x_chr)
+  
+  # allow integer or decimal serials
+  is_num <- grepl("^\\d+(?:[.,]\\d+)?$", x_chr)
   if (any(is_num, na.rm = TRUE)) {
+    ser <- sub(",", ".", x_chr[is_num], fixed = TRUE)
     suppressWarnings({
-      out[is_num] <- as.Date(as.numeric(x_chr[is_num]), origin = "1899-12-30")
+      out[is_num] <- as.Date(as.numeric(ser), origin = "1899-12-30")
     })
   }
-
+  
   idx <- !is_num & !is.na(x_chr)
   if (any(idx)) {
     tmp <- sub("[ T].*$", "", x_chr[idx])
     tmp <- gsub("[.\\-]", "/", tmp)
-
+    
     p <- suppressWarnings(lubridate::dmy(tmp))
     miss <- is.na(p)
     if (any(miss)) p[miss] <- suppressWarnings(lubridate::ymd(tmp[miss]))
     miss <- is.na(p)
     if (any(miss)) p[miss] <- suppressWarnings(lubridate::mdy(tmp[miss]))
-
+    
     out[idx] <- p
   }
-
   out
 }
+
 
 parse_decimal_number <- function(x) {
   if (is.null(x)) return(numeric())
@@ -283,17 +285,17 @@ filter_non_empty_code_barres <- function(df) {
 }
 
 join_extractions_biobank <- function(extractions, biobank) {
-  if (is.null(extractions) || !nrow(extractions) || is.null(biobank) || !nrow(biobank)) {
-    return(tibble())
+  if (is.null(extractions) || !nrow(extractions)) return(tibble())
+  
+  # Ensure expected keys exist
+  if (!"code_barres_kps" %in% names(extractions)) extractions$code_barres_kps <- NA_character_
+  if (!"numero" %in% names(extractions))          extractions$numero          <- NA_character_
+  
+  # If no clean biobank yet, just return the extraction data so QC works
+  if (is.null(biobank) || !nrow(biobank)) {
+    return(extractions)
   }
-
-  if (!"code_barres_kps" %in% names(extractions)) {
-    extractions$code_barres_kps <- NA_character_
-  }
-  if (!"numero" %in% names(extractions)) {
-    extractions$numero <- NA_character_
-  }
-
+  
   extractions |>
     mutate(
       numero = as.character(numero),
@@ -301,13 +303,11 @@ join_extractions_biobank <- function(extractions, biobank) {
     ) |>
     left_join(
       biobank |>
-        select(
-          barcode, lab_id, zone, province, date_sample,
-          date_received, date_result, study
-        ),
+        select(barcode, lab_id, zone, province, date_sample, date_received, date_result, study),
       by = c("code_barres_kps" = "barcode", "numero" = "lab_id")
     )
 }
+
 
 flag_extractions <- function(extractions_joined) {
   if (is.null(extractions_joined) || !nrow(extractions_joined)) {
@@ -315,7 +315,7 @@ flag_extractions <- function(extractions_joined) {
   }
 
   dups_exact <- extractions_joined |>
-    mutate(vol_key = round(as.numeric(volume_ml), 2)) |>
+    mutate(vol_key = round(parse_decimal_number(volume_ml), 2)) |>
     group_by(code_barres_kps, numero, vol_key) |>
     filter(dplyr::n() > 1) |>
     ungroup()
@@ -364,7 +364,7 @@ flag_extractions <- function(extractions_joined) {
 
   extractions_dedup <- extractions_flagged |>
     arrange(code_barres_kps, numero, desc(file_date)) |>
-    group_by(code_barres_kps, numero, round(as.numeric(volume_ml), 2)) |>
+    group_by(code_barres_kps, numero, round(parse_decimal_number(volume_ml), 2))|>
     slice(1) |>
     ungroup()
 
@@ -949,24 +949,17 @@ server <- function(input, output, session) {
   transport_qa <- reactive({
     dat <- transport_long()
     if (!nrow(dat)) return(tibble())
-
+    
     seg_levels <- levels(dat$segment)
-    tibble(
-      segment = seg_levels,
-      n_non_na = purrr::map_dbl(seg_levels, ~ sum(dat$segment == .x, na.rm = TRUE)),
-      n_zero = purrr::map_dbl(seg_levels, ~ sum(dat$segment == .x & dat$days == 0, na.rm = TRUE)),
-      p95 = purrr::map_dbl(
-        seg_levels,
-        ~ {
-          vals <- dat$days[dat$segment == .x]
-          if (length(vals)) {
-            stats::quantile(vals, 0.95, na.rm = TRUE, names = FALSE)
-          } else {
-            NA_real_
-          }
-        }
+    purrr::map_dfr(seg_levels, function(s) {
+      vals <- dat$days[dat$segment == s]
+      tibble(
+        segment  = s,
+        n_non_na = sum(!is.na(vals)),
+        n_zero   = sum(vals %in% 0, na.rm = TRUE),
+        p95      = if (length(vals)) stats::quantile(vals, 0.95, na.rm = TRUE, names = FALSE) else NA_real_
       )
-    )
+    })
   })
 
   transport_violations <- reactive({
@@ -1041,11 +1034,15 @@ server <- function(input, output, session) {
   extractions_filtered <- reactive({
     df <- extractions_dedup()
     if (is.null(df) || !nrow(df)) return(tibble())
-
-    df <- df |> mutate(
-      volume_num = parse_decimal_number(volume_ml),
-      file_date = as.Date(file_date)
-    )
+    
+    # Ensure the column exists
+    if (!"volume_ml" %in% names(df)) df$volume_ml <- NA_character_
+    
+    df <- df |>
+      mutate(
+        volume_num = parse_decimal_number(volume_ml),
+        file_date = as.Date(file_date)
+      )
 
     if (!is.null(input$qc_prov) && input$qc_prov != "All" && "province" %in% names(df)) {
       df <- df |> filter(!is.na(province) & province == input$qc_prov)
@@ -1186,6 +1183,7 @@ server <- function(input, output, session) {
     req(df)
     
     df |>
+      filter(!is.na(date_sample)) |>
       count(week = floor_date(date_sample, "week"), study) |>
       ggplot(aes(week, n, fill = study)) +
       geom_col() +
