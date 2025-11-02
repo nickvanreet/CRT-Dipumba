@@ -79,6 +79,25 @@ parse_decimal_number <- function(x) {
   parsed
 }
 
+safe_days <- function(to, from, max_ok = 90) {
+  d <- as.numeric(difftime(to, from, units = "days"))
+  d[!is.finite(d) | d < 0 | d > max_ok] <- NA_real_
+  d
+}
+
+clean_temp_code <- function(x) {
+  if (is.null(x)) return(character())
+  lab <- stringi::stri_trans_general(as.character(x), "Latin-ASCII")
+  lab <- toupper(trimws(lab))
+  dplyr::case_when(
+    lab == "" ~ NA_character_,
+    grepl("^A", lab) ~ "Ambiante",
+    grepl("^F", lab) ~ "Frigo",
+    grepl("^C", lab) ~ "Congelateur",
+    TRUE ~ NA_character_
+  )
+}
+
 read_biobank_file <- function(path) {
   if (!file.exists(path)) return(NULL)
   tryCatch({
@@ -103,6 +122,9 @@ clean_biobank_data <- function(df) {
     rename_first_match("barcode",   "code.*barr|barcode|code.*bar") |>
     rename_first_match("lab_id",    "num[eé]ro|id.*lab|sample.*id") |>
     rename_first_match("date_raw",  "date.*pr[eé]lev|date.*sample|^date$") |>
+    rename_first_match("date_env_cpltha_raw", "date.*env.*cpltha|env.*cpltha") |>
+    rename_first_match("date_rec_cpltha_raw", "date.*recept.*cpltha|rec.*cpltha") |>
+    rename_first_match("date_env_inrb_raw",   "date.*env.*inrb|inrb") |>
     rename_first_match("age",       "^age(\\b|_)|age.*(ans|years)?$") |>
     rename_first_match("sex",       "^sex|^sexe|^gender$") |>
     rename_first_match("zone",      "zone.*sant[eé]|health.*zone|^zs$") |>
@@ -113,18 +135,24 @@ clean_biobank_data <- function(df) {
     rename_first_match("date_received_raw", "date.*recept|date.*arriv|recept.*lab|arriv[eé]e") |>
     rename_first_match("date_result_raw",   "date.*result|result.*date|date.*sortie") |>
     rename_first_match("doorlooptijd_raw",  "doorloop|turnaround|t\\.?a\\.?t") |>
-    rename_first_match("drs_extract_raw",   "drs.*extract|extract.*drs|date.*drs")
+    rename_first_match("drs_extract_raw",   "drs.*extract|extract.*drs|date.*drs") |>
+    rename_first_match("temp_transport_raw", "temp.*transport") |>
+    rename_first_match("temp_cpltha_raw",    "temp.*stockage|temp.*cpltha")
   
   # --- ensure expected columns exist ---
-  needed <- c("barcode","lab_id","date_raw","age","sex","zone","province","study",
+  needed <- c("barcode","lab_id","date_raw","date_env_cpltha_raw","date_rec_cpltha_raw",
+              "date_env_inrb_raw","age","sex","zone","province","study",
               "structure","unit","date_received_raw","date_result_raw",
-              "doorlooptijd_raw","drs_extract_raw")
+              "doorlooptijd_raw","drs_extract_raw","temp_transport_raw","temp_cpltha_raw")
   for (nm in needed) if (!nm %in% names(df)) df[[nm]] <- NA_character_
   
   # --- standardize values ---
   df <- df |>
     mutate(
       date_sample = parse_any_date(date_raw),
+      date_env_cpltha = parse_any_date(date_env_cpltha_raw),
+      date_rec_cpltha = parse_any_date(date_rec_cpltha_raw),
+      date_env_inrb   = parse_any_date(date_env_inrb_raw),
       date_received = parse_any_date(date_received_raw),
       date_result   = parse_any_date(date_result_raw),
       date_drs_extract = parse_any_date(drs_extract_raw),
@@ -145,6 +173,13 @@ clean_biobank_data <- function(df) {
         TRUE ~ NA_real_
       ),
       doorlooptijd_days = ifelse(is.finite(doorlooptijd_days), doorlooptijd_days, NA_real_),
+
+      temp_field = clean_temp_code(temp_transport_raw),
+      temp_hs    = clean_temp_code(temp_cpltha_raw),
+
+      transport_field_hs = safe_days(date_env_cpltha, date_sample, max_ok = 30),
+      transport_hs_lsd   = safe_days(date_rec_cpltha, date_env_cpltha, max_ok = 30),
+      transport_lsd_inrb = safe_days(date_env_inrb, date_rec_cpltha, max_ok = 90),
 
       sex = toupper(trimws(sex)),
       sex = dplyr::case_when(
@@ -487,7 +522,69 @@ ui <- page_navbar(
       )
     )
   ),
-  
+
+  # === TRANSPORT TAB ===
+  nav_panel(
+    title = "Transport",
+
+    layout_columns(
+      fill = FALSE,
+      col_widths = c(4, 4, 4),
+
+      value_box(
+        title = "Field → HS",
+        value = textOutput("vb_transport_field_hs"),
+        showcase = bs_icon("truck"),
+        theme = "primary"
+      ),
+
+      value_box(
+        title = "HS → LSD",
+        value = textOutput("vb_transport_hs_lsd"),
+        showcase = bs_icon("arrow-right"),
+        theme = "info"
+      ),
+
+      value_box(
+        title = "LSD → INRB",
+        value = textOutput("vb_transport_lsd_inrb"),
+        showcase = bs_icon("building"),
+        theme = "success"
+      )
+    ),
+
+    layout_columns(
+      fill = FALSE,
+      col_widths = c(6, 6),
+
+      card(
+        card_header("Weekly trends"),
+        plotOutput("plot_transport_weekly", height = 320)
+      ),
+
+      card(
+        card_header("Distribution by segment"),
+        plotOutput("plot_transport_distribution", height = 320)
+      )
+    ),
+
+    layout_columns(
+      fill = FALSE,
+      col_widths = c(6, 6),
+
+      card(
+        card_header("Segment summary"),
+        tableOutput("table_transport_summary")
+      ),
+
+      card(
+        card_header("QA checks"),
+        tableOutput("table_transport_qa"),
+        DTOutput("transport_viol_tbl")
+      )
+    )
+  ),
+
   # === DEMOGRAPHICS TAB ===
   nav_panel(
     title = "Demographics",
@@ -778,6 +875,121 @@ server <- function(input, output, session) {
     df
   })
 
+  transport_long <- reactive({
+    df <- filtered_data()
+    req(df)
+
+    needed <- c("date_sample", "transport_field_hs", "transport_hs_lsd", "transport_lsd_inrb", "temp_field", "temp_hs")
+    if (!all(needed %in% names(df))) return(tibble())
+
+    df |>
+      transmute(
+        sample_date = date_sample,
+        `Field → HS` = transport_field_hs,
+        `HS → LSD` = transport_hs_lsd,
+        `LSD → INRB` = transport_lsd_inrb,
+        temp_field,
+        temp_hs
+      ) |>
+      tidyr::pivot_longer(
+        cols = c(`Field → HS`, `HS → LSD`, `LSD → INRB`),
+        names_to = "segment",
+        values_to = "days",
+        values_drop_na = TRUE
+      ) |>
+      mutate(
+        temp_code = dplyr::case_when(
+          segment == "Field → HS" ~ temp_field,
+          segment == "HS → LSD" ~ temp_hs,
+          TRUE ~ NA_character_
+        ),
+        temp_code = dplyr::case_when(
+          is.na(temp_code) ~ "Not recorded",
+          temp_code == "Ambiante" ~ "Ambiante",
+          temp_code == "Frigo" ~ "Frigo",
+          temp_code == "Congelateur" ~ "Congelateur",
+          TRUE ~ "Not recorded"
+        ),
+        week = lubridate::floor_date(sample_date, "week"),
+        segment = factor(segment, levels = c("Field → HS", "HS → LSD", "LSD → INRB")),
+        temp_code = factor(temp_code, levels = c("Ambiante", "Frigo", "Congelateur", "Not recorded"))
+      ) |>
+      filter(!is.na(sample_date))
+  })
+
+  transport_summary <- reactive({
+    dat <- transport_long()
+    if (!nrow(dat)) return(tibble())
+
+    dat |>
+      group_by(segment) |>
+      summarise(
+        n = dplyr::n(),
+        median = stats::median(days, na.rm = TRUE),
+        iqr = stats::IQR(days, na.rm = TRUE),
+        p95 = stats::quantile(days, 0.95, na.rm = TRUE, names = FALSE),
+        .groups = "drop"
+      )
+  })
+
+  transport_weekly <- reactive({
+    dat <- transport_long()
+    if (!nrow(dat)) return(tibble())
+
+    dat |>
+      filter(!is.na(week)) |>
+      group_by(segment, week) |>
+      summarise(
+        mean_days = mean(days, na.rm = TRUE),
+        count = dplyr::n(),
+        .groups = "drop"
+      )
+  })
+
+  transport_qa <- reactive({
+    dat <- transport_long()
+    if (!nrow(dat)) return(tibble())
+
+    seg_levels <- levels(dat$segment)
+    tibble(
+      segment = seg_levels,
+      n_non_na = purrr::map_dbl(seg_levels, ~ sum(dat$segment == .x, na.rm = TRUE)),
+      n_zero = purrr::map_dbl(seg_levels, ~ sum(dat$segment == .x & dat$days == 0, na.rm = TRUE)),
+      p95 = purrr::map_dbl(
+        seg_levels,
+        ~ {
+          vals <- dat$days[dat$segment == .x]
+          if (length(vals)) {
+            stats::quantile(vals, 0.95, na.rm = TRUE, names = FALSE)
+          } else {
+            NA_real_
+          }
+        }
+      )
+    )
+  })
+
+  transport_violations <- reactive({
+    df <- filtered_data(); req(df)
+
+    needed <- c("date_sample", "date_env_cpltha", "date_rec_cpltha", "date_env_inrb")
+    if (!all(needed %in% names(df))) return(tibble())
+
+    df |>
+      transmute(
+        id = dplyr::coalesce(barcode, lab_id),
+        date_sample,
+        date_env_cpltha,
+        date_rec_cpltha,
+        date_env_inrb
+      ) |>
+      filter(
+        (!is.na(date_sample) & !is.na(date_env_cpltha) & date_env_cpltha < date_sample) |
+          (!is.na(date_env_cpltha) & !is.na(date_rec_cpltha) & date_rec_cpltha < date_env_cpltha) |
+          (!is.na(date_rec_cpltha) & !is.na(date_env_inrb) & date_env_inrb < date_rec_cpltha)
+      )
+  })
+
   extractions_joined <- reactive({
     join_extractions_biobank(extraction_raw(), clean_data())
   })
@@ -952,9 +1164,23 @@ server <- function(input, output, session) {
             scales::comma(length(drs_dates)),
             scales::comma(batches))
   })
-  
+
+  transport_value_text <- function(segment_label) {
+    summ <- transport_summary()
+    if (!nrow(summ)) return("No data")
+    row <- summ |> filter(as.character(segment) == segment_label)
+    if (!nrow(row) || is.na(row$median)) return("No data")
+    sprintf("%s days (n = %s)",
+            scales::number(row$median, accuracy = 0.1),
+            scales::comma(row$n))
+  }
+
+  output$vb_transport_field_hs <- renderText({ transport_value_text("Field → HS") })
+  output$vb_transport_hs_lsd   <- renderText({ transport_value_text("HS → LSD") })
+  output$vb_transport_lsd_inrb <- renderText({ transport_value_text("LSD → INRB") })
+
   # === OVERVIEW PLOTS ===
-  
+
   output$plot_timeline <- renderPlot({
     df <- filtered_data()
     req(df)
@@ -1028,6 +1254,96 @@ server <- function(input, output, session) {
       theme_minimal() +
       theme(legend.position = "bottom")
   }, res = 96)
+
+  seg_cols <- c("Field → HS" = "#1b9e77", "HS → LSD" = "#d95f02", "LSD → INRB" = "#7570b3")
+  temp_shapes <- c(Ambiante = 21, Frigo = 24, Congelateur = 22, `Not recorded` = 20)
+  temp_labels <- c(Ambiante = "Ambiante", Frigo = "Frigo", Congelateur = "Congélateur", `Not recorded` = "Not recorded")
+
+  output$plot_transport_weekly <- renderPlot({
+    dat <- transport_weekly()
+    if (!nrow(dat)) {
+      return(ggplot() +
+               annotate("text", x = 0, y = 0, label = "No transport data", size = 6) +
+               theme_void())
+    }
+
+    ggplot(dat, aes(week, mean_days, colour = segment)) +
+      geom_line(linewidth = 1) +
+      geom_point(aes(size = count), alpha = 0.85) +
+      scale_colour_manual(values = seg_cols) +
+      scale_size_continuous("Samples", range = c(2, 6)) +
+      scale_y_continuous("Mean days", breaks = scales::pretty_breaks()) +
+      scale_x_date(NULL, date_breaks = "2 weeks", date_labels = "%d %b") +
+      labs(title = "Weekly mean transport time") +
+      theme_minimal(base_size = 13) +
+      theme(legend.position = "bottom",
+            axis.text.x = element_text(angle = 45, hjust = 1))
+  }, res = 96)
+
+  output$plot_transport_distribution <- renderPlot({
+    dat <- transport_long()
+    if (!nrow(dat)) {
+      return(ggplot() +
+               annotate("text", x = 0, y = 0, label = "No transport data", size = 6) +
+               theme_void())
+    }
+
+    ggplot(dat, aes(x = segment, y = days, colour = segment)) +
+      geom_boxplot(aes(fill = segment), alpha = 0.5, width = 0.6, outlier.shape = NA) +
+      geom_jitter(aes(shape = temp_code), width = 0.15, alpha = 0.6, size = 2) +
+      scale_colour_manual(values = seg_cols, guide = "none") +
+      scale_fill_manual(values = seg_cols, guide = "none") +
+      scale_shape_manual(values = temp_shapes, labels = temp_labels, name = "Temp.") +
+      scale_y_continuous("Days", breaks = scales::pretty_breaks()) +
+      labs(x = NULL, title = "Transport time distribution by segment") +
+      theme_minimal(base_size = 13)
+  }, res = 96)
+
+  output$table_transport_summary <- renderTable({
+    summ <- transport_summary()
+    if (!nrow(summ)) return(tibble(Message = "No transport data available"))
+
+    summ |>
+      mutate(
+        segment = as.character(segment),
+        n = scales::comma(n),
+        median = scales::number(median, accuracy = 0.1),
+        iqr = scales::number(iqr, accuracy = 0.1),
+        p95 = scales::number(p95, accuracy = 0.1)
+      ) |>
+      rename(
+        Segment = segment,
+        Samples = n,
+        `Median (days)` = median,
+        `IQR (days)` = iqr,
+        `95th pct (days)` = p95
+      )
+  }, striped = TRUE, hover = TRUE, bordered = TRUE)
+
+  output$table_transport_qa <- renderTable({
+    qa <- transport_qa()
+    if (!nrow(qa)) return(tibble(Message = "No transport QA metrics"))
+
+    qa |>
+      mutate(
+        segment = as.character(segment),
+        n_non_na = scales::comma(n_non_na),
+        n_zero = scales::comma(n_zero),
+        p95 = scales::number(p95, accuracy = 0.1)
+      ) |>
+      rename(
+        Segment = segment,
+        `Records` = n_non_na,
+        `Zero days` = n_zero,
+        `95th pct (days)` = p95
+      )
+  }, striped = TRUE, hover = TRUE, bordered = TRUE)
+
+  output$transport_viol_tbl <- renderDT({
+    viol <- transport_violations()
+    if (!nrow(viol)) viol <- tibble(Message = "No date inconsistencies detected")
+    datatable(viol, options = list(pageLength = 10, scrollX = TRUE))
+  })
 
   output$table_drs_extract <- renderTable({
     dedup <- extractions_dedup()
