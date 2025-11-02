@@ -18,6 +18,36 @@ suppressPackageStartupMessages({
 
 # === CORE FUNCTIONS ===
 
+parse_any_date <- function(x) {
+  x_chr <- trimws(as.character(x))
+  x_chr[x_chr %in% c("", "NA", "N/A", "na", "NaN", "NULL")] <- NA
+
+  out <- as.Date(rep(NA_integer_, length(x_chr)), origin = "1970-01-01")
+
+  is_num <- grepl("^\\d+$", x_chr)
+  if (any(is_num, na.rm = TRUE)) {
+    suppressWarnings({
+      out[is_num] <- as.Date(as.numeric(x_chr[is_num]), origin = "1899-12-30")
+    })
+  }
+
+  idx <- !is_num & !is.na(x_chr)
+  if (any(idx)) {
+    tmp <- sub("[ T].*$", "", x_chr[idx])
+    tmp <- gsub("[.\\-]", "/", tmp)
+
+    p <- suppressWarnings(lubridate::dmy(tmp))
+    miss <- is.na(p)
+    if (any(miss)) p[miss] <- suppressWarnings(lubridate::ymd(tmp[miss]))
+    miss <- is.na(p)
+    if (any(miss)) p[miss] <- suppressWarnings(lubridate::mdy(tmp[miss]))
+
+    out[idx] <- p
+  }
+
+  out
+}
+
 read_biobank_file <- function(path) {
   if (!file.exists(path)) return(NULL)
   tryCatch({
@@ -59,27 +89,6 @@ clean_biobank_data <- function(df) {
               "structure","unit","date_received_raw","date_result_raw",
               "doorlooptijd_raw","drs_extract_raw")
   for (nm in needed) if (!nm %in% names(df)) df[[nm]] <- NA_character_
-  
-  # --- date parser that accepts Excel numerics + dmy/ymd/mdy ---
-  parse_any_date <- function(x) {
-    x_chr <- as.character(x)
-    out <- as.Date(NA)
-    
-    is_num <- suppressWarnings(!is.na(as.numeric(x_chr)))
-    if (any(is_num, na.rm = TRUE)) {
-      out_num <- suppressWarnings(as.Date(as.numeric(x_chr), origin = "1899-12-30"))
-      out[is_num] <- out_num[is_num]
-    }
-    
-    x_norm <- gsub("[.\\-]", "/", x_chr)
-    tryd <- function(f) suppressWarnings(f(x_norm))
-    for (f in list(lubridate::dmy, lubridate::ymd, lubridate::mdy)) {
-      cand <- tryd(f)
-      replace <- is.na(out) & !is.na(cand)
-      out[replace] <- cand[replace]
-    }
-    out
-  }
   
   # --- standardize values ---
   df <- df |>
@@ -143,6 +152,154 @@ make_age_groups <- function(age, width = 5) {
   hi <- suppressWarnings(ceiling(max(age, na.rm = TRUE) / width) * width)
   if (!is.finite(hi) || hi <= 0) hi <- width
   cut(age, breaks = seq(0, hi, by = width), right = FALSE, include.lowest = TRUE)
+}
+
+read_extractions_dir <- function(dir_extraction) {
+  if (!dir.exists(dir_extraction)) return(tibble())
+
+  files <- list.files(dir_extraction, pattern = "\\.xlsx?$", full.names = TRUE)
+  if (!length(files)) return(tibble())
+
+  read_one <- function(f) {
+    sneak <- suppressMessages(readxl::read_excel(f, n_max = 1))
+    col_types <- rep("text", ncol(sneak))
+
+    suppressMessages(
+      readxl::read_excel(f, col_types = col_types, .name_repair = "minimal") |>
+        janitor::clean_names()
+    ) |>
+      mutate(
+        source_file = basename(f),
+        file_date = {
+          m <- stringr::str_match(basename(f), "^(\\d{6})")
+          if (!is.na(m[1, 2])) as.Date(m[1, 2], format = "%y%m%d") else as.Date(NA)
+        }
+      )
+  }
+
+  purrr::map_dfr(files, read_one) |>
+    mutate(
+      date_prelev = if ("date_de_prelevement_jj_mm_aaaa" %in% names(.))
+        parse_any_date(date_de_prelevement_jj_mm_aaaa) else as.Date(NA),
+      date_env_cpltha = if ("date_envoi_vers_cpltha_jj_mm_aaaa" %in% names(.))
+        parse_any_date(date_envoi_vers_cpltha_jj_mm_aaaa) else as.Date(NA),
+      date_rec_cpltha = if ("date_de_reception_cpltha_jj_mm_aaaa" %in% names(.))
+        parse_any_date(date_de_reception_cpltha_jj_mm_aaaa) else as.Date(NA),
+      date_env_inrb = if ("date_denvoi_inrb" %in% names(.))
+        parse_any_date(date_denvoi_inrb) else as.Date(NA),
+      volume_raw = if ("volume_total_echantillon_sang_drs_ml" %in% names(.))
+        volume_total_echantillon_sang_drs_ml else NA_character_,
+      volume_ml = suppressWarnings(as.numeric(volume_raw)),
+      volume_ml = ifelse(!is.na(volume_ml) & volume_ml > 10, volume_ml / 10, volume_ml)
+    ) |>
+    (
+      function(df) {
+        if ("code_barres_kps" %in% names(df)) {
+          dplyr::filter(df, !(is.na(code_barres_kps) | code_barres_kps == ""))
+        } else {
+          df
+        }
+      }
+    )
+}
+
+join_extractions_biobank <- function(extractions, biobank) {
+  if (is.null(extractions) || !nrow(extractions) || is.null(biobank) || !nrow(biobank)) {
+    return(tibble())
+  }
+
+  if (!"code_barres_kps" %in% names(extractions)) {
+    extractions$code_barres_kps <- NA_character_
+  }
+  if (!"numero" %in% names(extractions)) {
+    extractions$numero <- NA_character_
+  }
+
+  extractions |>
+    mutate(
+      numero = as.character(numero),
+      code_barres_kps = as.character(code_barres_kps)
+    ) |>
+    left_join(
+      biobank |>
+        select(
+          barcode, lab_id, zone, province, date_sample,
+          date_received, date_result, study
+        ),
+      by = c("code_barres_kps" = "barcode", "numero" = "lab_id")
+    )
+}
+
+flag_extractions <- function(extractions_joined) {
+  if (is.null(extractions_joined) || !nrow(extractions_joined)) {
+    return(list(flagged = tibble(), dedup = tibble()))
+  }
+
+  dups_exact <- extractions_joined |>
+    mutate(vol_key = round(as.numeric(volume_ml), 2)) |>
+    group_by(code_barres_kps, numero, vol_key) |>
+    filter(dplyr::n() > 1) |>
+    ungroup()
+
+  same_barcode_diff_num <- extractions_joined |>
+    filter(!is.na(code_barres_kps)) |>
+    group_by(code_barres_kps) |>
+    filter(dplyr::n_distinct(numero, na.rm = TRUE) > 1) |>
+    ungroup()
+
+  reextractions <- same_barcode_diff_num |>
+    group_by(code_barres_kps) |>
+    filter(dplyr::n_distinct(round(as.numeric(volume_ml), 2), na.rm = TRUE) > 1) |>
+    ungroup()
+
+  same_barcode_same_vol_new_num <- same_barcode_diff_num |>
+    group_by(code_barres_kps) |>
+    filter(dplyr::n_distinct(round(as.numeric(volume_ml), 2), na.rm = TRUE) == 1) |>
+    ungroup()
+
+  same_numero_diff_barcode <- extractions_joined |>
+    filter(!is.na(numero)) |>
+    group_by(numero) |>
+    filter(dplyr::n_distinct(code_barres_kps, na.rm = TRUE) > 1) |>
+    ungroup()
+
+  extractions_flagged <- extractions_joined |>
+    mutate(
+      vol_key = round(as.numeric(volume_ml), 2),
+      flag = case_when(
+        paste(code_barres_kps, numero, vol_key) %in%
+          paste(dups_exact$code_barres_kps, dups_exact$numero, dups_exact$vol_key)
+        ~ "EXACT_DUPLICATE",
+        code_barres_kps %in% reextractions$code_barres_kps &
+          numero %in% reextractions$numero
+        ~ "RE_EXTRACTION_SAME_BARCODE_DIFF_NUM_DIFF_VOL",
+        code_barres_kps %in% same_barcode_same_vol_new_num$code_barres_kps &
+          numero %in% same_barcode_same_vol_new_num$numero
+        ~ "SUSPECT_SAME_BARCODE_SAME_VOL_NEW_NUM",
+        numero %in% same_numero_diff_barcode$numero &
+          code_barres_kps %in% same_numero_diff_barcode$code_barres_kps
+        ~ "SUSPECT_SAME_NUM_DIFF_BARCODE",
+        TRUE ~ "OK"
+      )
+    )
+
+  extractions_dedup <- extractions_flagged |>
+    arrange(code_barres_kps, numero, desc(file_date)) |>
+    group_by(code_barres_kps, numero, round(as.numeric(volume_ml), 2)) |>
+    slice(1) |>
+    ungroup()
+
+  list(flagged = extractions_flagged, dedup = extractions_dedup)
+}
+
+empty_extractions <- function() {
+  tibble(
+    code_barres_kps = character(),
+    numero = character(),
+    volume_ml = numeric(),
+    file_date = as.Date(character()),
+    source_file = character()
+  )
 }
 
 # === UI ===
@@ -315,7 +472,7 @@ ui <- page_navbar(
   # === GEOGRAPHY TAB ===
   nav_panel(
     title = "Geography",
-    
+
     layout_columns(
       col_widths = c(4, 8),
       
@@ -341,7 +498,74 @@ ui <- page_navbar(
       )
     )
   ),
-  
+
+  # === EXTRACTION QC TAB ===
+  nav_panel(
+    title = "Extraction QC",
+
+    layout_columns(
+      col_widths = c(4, 8),
+
+      card(
+        card_header("Settings"),
+        textInput(
+          "qc_dir", "Extractions directory",
+          value = "C:/Users/nvanreet/ITG/THA - Digital Management System - CRT Dipumba Upload - CRT Dipumba Upload/02 - Extractions"
+        ),
+        actionButton("qc_refresh", "Load extractions", class = "btn-primary w-100"),
+        div(class = "mt-2", textOutput("qc_status")),
+        hr(),
+        sliderInput(
+          "qc_rng", "Acceptable volume range (mL)",
+          min = 0.5, max = 3.5, value = c(1.5, 2.5), step = 0.1
+        ),
+        selectInput("qc_prov", "Province", choices = "All", selected = "All"),
+        selectInput("qc_zone", "Zone", choices = "All", selected = "All"),
+        dateRangeInput(
+          "qc_date_rng", "Sample date filter",
+          start = NULL, end = NULL, format = "yyyy-mm-dd", weekstart = 1
+        ),
+        radioButtons(
+          "qc_agg", "Aggregation",
+          choices = c("Day" = "day", "Month" = "month", "Year" = "year"),
+          selected = "day", inline = TRUE
+        ),
+        checkboxInput("qc_show_out", "Show out-of-range only", value = FALSE),
+        hr(),
+        downloadButton("qc_dl_zone", "Download Zone Summary", class = "btn-sm w-100 mb-2"),
+        downloadButton("qc_dl_out", "Download Outliers", class = "btn-sm w-100 mb-2"),
+        downloadButton("qc_dl_dup", "Download Duplicates", class = "btn-sm w-100 mb-2"),
+        downloadButton("qc_dl_filt", "Download Filtered Data", class = "btn-sm w-100 mb-2"),
+        downloadButton("qc_dl_agg", "Download Aggregated Data", class = "btn-sm w-100")
+      ),
+
+      card(
+        card_header("Extraction Insights"),
+        navset_tab(
+          nav_panel(
+            "Overview",
+            plotOutput("qc_hist_vol", height = 320),
+            plotOutput("qc_box_vol", height = 260)
+          ),
+          nav_panel(
+            "By Zone",
+            plotOutput("qc_trend_filedate", height = 320),
+            DTOutput("qc_zone_tbl")
+          ),
+          nav_panel(
+            "Time Series",
+            plotOutput("qc_agg_count_plot", height = 280),
+            plotOutput("qc_agg_volume_plot", height = 280),
+            DTOutput("qc_agg_tbl")
+          ),
+          nav_panel("Per sample", DTOutput("qc_per_sample_tbl")),
+          nav_panel("Outliers", DTOutput("qc_out_tbl")),
+          nav_panel("Duplicates", DTOutput("qc_dup_tbl"))
+        )
+      )
+    )
+  ),
+
   # === DATA TAB ===
   nav_panel(
     title = "Data",
@@ -389,6 +613,9 @@ server <- function(input, output, session) {
   
   raw_data <- reactiveVal(NULL)
   clean_data <- reactiveVal(NULL)
+
+  extraction_status <- reactiveVal("No extraction data loaded.")
+  extraction_raw <- reactiveVal(empty_extractions())
   
   # File selector
   output$file_selector <- renderUI({
@@ -454,13 +681,38 @@ server <- function(input, output, session) {
     if (is.null(df)) return("No data loaded")
     sprintf("%s samples loaded", scales::comma(nrow(df)))
   })
+
+  observeEvent(input$qc_refresh, {
+    dir <- normalizePath(input$qc_dir, winslash = "/", mustWork = FALSE)
+    if (!dir.exists(dir)) {
+      extraction_status("Directory not found. Check the path.")
+      extraction_raw(empty_extractions())
+      showNotification("Extraction directory does not exist.", type = "error")
+      return()
+    }
+
+    dat <- read_extractions_dir(dir)
+    if (!nrow(dat)) {
+      extraction_status("No extraction files found in this directory.")
+      extraction_raw(empty_extractions())
+      showNotification("No extraction files found.", type = "warning")
+      return()
+    }
+
+    extraction_raw(dat)
+    file_count <- length(unique(na.omit(dat$source_file)))
+    sample_count <- nrow(dat)
+    extraction_status(sprintf("%s files · %s samples",
+                              scales::comma(file_count),
+                              scales::comma(sample_count)))
+  })
   
   # === FILTERED DATA ===
   
   filtered_data <- reactive({
     df <- clean_data(); req(df)
     if (!nrow(df)) return(df)
-    
+
     dr <- input$date_range
     if (length(dr) == 2 && all(!is.na(dr))) {
       df <- df %>% dplyr::filter(date_sample >= dr[1], date_sample <= dr[2])
@@ -478,8 +730,120 @@ server <- function(input, output, session) {
     if (length(input$filter_sex)) {
       df <- df %>% dplyr::filter(sex %in% input$filter_sex)
     }
-    
+
     df
+  })
+
+  extractions_joined <- reactive({
+    join_extractions_biobank(extraction_raw(), clean_data())
+  })
+
+  extractions_flagged <- reactive({
+    flag_extractions(extractions_joined())
+  })
+
+  extractions_dedup <- reactive({
+    res <- extractions_flagged()
+    if (is.null(res$dedup)) tibble() else res$dedup
+  })
+
+  observeEvent(extractions_dedup(), {
+    df <- extractions_dedup()
+    if (is.null(df) || !nrow(df) || !"province" %in% names(df)) {
+      updateSelectInput(session, "qc_prov", choices = "All", selected = "All")
+      updateSelectInput(session, "qc_zone", choices = "All", selected = "All")
+      return()
+    }
+
+    provs <- sort(unique(na.omit(df$province)))
+    sel_prov <- if (input$qc_prov %in% c("All", provs)) input$qc_prov else "All"
+    updateSelectInput(session, "qc_prov", choices = c("All", provs), selected = sel_prov)
+
+    rng <- suppressWarnings(range(df$date_prelev, na.rm = TRUE))
+    if (all(is.finite(rng))) {
+      updateDateRangeInput(session, "qc_date_rng",
+                          start = rng[1], end = rng[2],
+                          min = rng[1], max = rng[2])
+    }
+  }, ignoreNULL = FALSE)
+
+  observeEvent(list(input$qc_prov, extractions_dedup()), {
+    df <- extractions_dedup()
+    if (is.null(df) || !nrow(df) || !"zone" %in% names(df)) {
+      updateSelectInput(session, "qc_zone", choices = "All", selected = "All")
+      return()
+    }
+
+    zones <- sort(unique(na.omit(df$zone)))
+    if (!is.null(input$qc_prov) && input$qc_prov != "All" && "province" %in% names(df)) {
+      zones <- sort(unique(na.omit(df$zone[df$province == input$qc_prov])))
+    }
+    sel_zone <- if (input$qc_zone %in% c("All", zones)) input$qc_zone else "All"
+    updateSelectInput(session, "qc_zone", choices = c("All", zones), selected = sel_zone)
+  }, ignoreNULL = FALSE)
+
+  extractions_filtered <- reactive({
+    df <- extractions_dedup()
+    if (is.null(df) || !nrow(df)) return(tibble())
+
+    df <- df |> mutate(
+      volume_num = suppressWarnings(as.numeric(volume_ml)),
+      file_date = as.Date(file_date)
+    )
+
+    if (!is.null(input$qc_prov) && input$qc_prov != "All" && "province" %in% names(df)) {
+      df <- df |> filter(!is.na(province) & province == input$qc_prov)
+    }
+
+    if (!is.null(input$qc_zone) && input$qc_zone != "All" && "zone" %in% names(df)) {
+      df <- df |> filter(!is.na(zone) & zone == input$qc_zone)
+    }
+
+    if (!is.null(input$qc_date_rng) && length(input$qc_date_rng) == 2 && all(!is.na(input$qc_date_rng)) && "date_prelev" %in% names(df)) {
+      d1 <- as.Date(input$qc_date_rng[1])
+      d2 <- as.Date(input$qc_date_rng[2])
+      df <- df |> filter(!is.na(date_prelev) & date_prelev >= d1 & date_prelev <= d2)
+    }
+
+    if (isTRUE(input$qc_show_out) && "volume_num" %in% names(df)) {
+      rng <- input$qc_rng
+      df <- df |> filter(!is.na(volume_num) & (volume_num < rng[1] | volume_num > rng[2]))
+    }
+
+    df
+  })
+
+  qc_agg_data <- reactive({
+    df <- extractions_filtered()
+    if (is.null(df) || !nrow(df) || !"date_prelev" %in% names(df) || !"volume_num" %in% names(df)) return(tibble())
+
+    df <- df |> filter(!is.na(date_prelev))
+    if (!nrow(df)) return(tibble())
+
+    agg <- input$qc_agg
+    df <- df |>
+      mutate(
+        period = dplyr::case_when(
+          agg == "day"   ~ date_prelev,
+          agg == "month" ~ lubridate::floor_date(date_prelev, unit = "month"),
+          agg == "year"  ~ as.Date(sprintf("%s-01-01", lubridate::year(date_prelev))),
+          TRUE ~ date_prelev
+        )
+      )
+
+    rng <- input$qc_rng
+    df |>
+      group_by(period) |>
+      summarise(
+        N = dplyr::n(),
+        Median = suppressWarnings(stats::median(volume_num, na.rm = TRUE)),
+        P10 = suppressWarnings(stats::quantile(volume_num, 0.10, na.rm = TRUE, names = FALSE)),
+        P90 = suppressWarnings(stats::quantile(volume_num, 0.90, na.rm = TRUE, names = FALSE)),
+        Out = sum(!is.na(volume_num) & (volume_num < rng[1] | volume_num > rng[2])),
+        `% Out` = round(100 * Out / pmax(N, 1), 1),
+        .groups = "drop"
+      ) |>
+      arrange(period)
   })
   
   # === VALUE BOXES ===
@@ -522,6 +886,14 @@ server <- function(input, output, session) {
   })
 
   output$vb_drs_extract <- renderText({
+    dedup <- extractions_dedup()
+    if (!is.null(dedup) && nrow(dedup)) {
+      batches <- dplyr::n_distinct(dedup$file_date)
+      return(sprintf("%s samples, %s batches",
+                     scales::comma(nrow(dedup)),
+                     scales::comma(batches)))
+    }
+
     df <- filtered_data(); req(df)
     drs_dates <- df$date_drs_extract[!is.na(df$date_drs_extract)]
     if (!length(drs_dates)) return("No data")
@@ -608,6 +980,26 @@ server <- function(input, output, session) {
   }, res = 96)
 
   output$table_drs_extract <- renderTable({
+    dedup <- extractions_dedup()
+    if (!is.null(dedup) && nrow(dedup)) {
+      tab <- dedup |>
+        mutate(file_date = as.Date(file_date)) |>
+        count(file_date, sort = TRUE)
+
+      if (!nrow(tab)) {
+        return(tibble(Message = "No extraction batches available"))
+      }
+
+      return(
+        tab |>
+          mutate(
+            file_date = format(file_date, "%Y-%m-%d"),
+            n = scales::comma(n)
+          ) |>
+          rename(`Extraction batch` = file_date, Samples = n)
+      )
+    }
+
     df <- filtered_data(); req(df)
     tab <- df |>
       filter(!is.na(date_drs_extract)) |>
@@ -625,6 +1017,209 @@ server <- function(input, output, session) {
       ) |>
       rename(`Extraction date` = date_drs_extract, Samples = n)
   }, striped = TRUE, hover = TRUE, bordered = TRUE)
+
+  # === EXTRACTION QC OUTPUTS ===
+
+  output$qc_status <- renderText({ extraction_status() })
+
+  output$qc_hist_vol <- renderPlot({
+    df <- extractions_filtered()
+    validate(need(nrow(df) > 0 && "volume_num" %in% names(df), "No extraction data."))
+    rng <- input$qc_rng
+    ggplot(df, aes(x = volume_num,
+                   fill = volume_num < rng[1] | volume_num > rng[2])) +
+      geom_histogram(binwidth = 0.1, colour = "black") +
+      geom_vline(xintercept = 2, linetype = "dashed", colour = "red") +
+      scale_fill_manual(values = c(`FALSE` = "steelblue", `TRUE` = "tomato"), guide = "none") +
+      labs(
+        title = "Distribution of sample volumes",
+        x = "Volume (mL)",
+        y = "Count",
+        subtitle = sprintf("Dashed = 2 mL | Range = %.1f–%.1f mL", rng[1], rng[2])
+      ) +
+      theme_minimal()
+  })
+
+  output$qc_box_vol <- renderPlot({
+    df <- extractions_filtered()
+    validate(need(nrow(df) > 0 && "volume_num" %in% names(df), "No extraction data."))
+    rng <- input$qc_rng
+    ggplot(df, aes(y = volume_num)) +
+      geom_boxplot(fill = "grey90", outlier.colour = "tomato") +
+      geom_jitter(height = 0, width = 0.1, alpha = 0.5) +
+      geom_hline(yintercept = 2, linetype = "dashed", colour = "red") +
+      geom_hline(yintercept = rng, linetype = "dotted", colour = "grey40") +
+      labs(title = "Volumes with outliers", y = "Volume (mL)") +
+      theme_minimal()
+  })
+
+  output$qc_trend_filedate <- renderPlot({
+    df <- extractions_filtered()
+    validate(need(nrow(df) > 0 && "file_date" %in% names(df) && "volume_num" %in% names(df), "No extraction data."))
+    ggplot(df, aes(x = file_date, y = volume_num, colour = zone)) +
+      geom_jitter(alpha = 0.4, width = 2) +
+      geom_hline(yintercept = 2, linetype = "dashed", colour = "red") +
+      labs(title = "Sample volumes by extraction batch", x = "file_date", y = "Volume (mL)") +
+      theme_minimal()
+  })
+
+  output$qc_zone_tbl <- renderDT({
+    df <- extractions_filtered()
+    if (!nrow(df) || !all(c("province", "zone", "volume_num") %in% names(df))) {
+      return(datatable(tibble(), options = list(pageLength = 15, scrollX = TRUE)))
+    }
+    rng <- input$qc_rng
+    summ <- df |>
+      group_by(province, zone) |>
+      summarise(
+        N = dplyr::n(),
+        Out = sum(!is.na(volume_num) & (volume_num < rng[1] | volume_num > rng[2])),
+        `% Out` = round(100 * Out / pmax(N, 1), 1),
+        Median = round(stats::median(volume_num, na.rm = TRUE), 2),
+        P10 = round(stats::quantile(volume_num, 0.10, na.rm = TRUE, names = FALSE), 2),
+        P90 = round(stats::quantile(volume_num, 0.90, na.rm = TRUE, names = FALSE), 2),
+        .groups = "drop"
+      ) |>
+      arrange(desc(`% Out`), desc(N))
+    datatable(summ, options = list(pageLength = 15, scrollX = TRUE))
+  })
+
+  output$qc_agg_count_plot <- renderPlot({
+    ad <- qc_agg_data()
+    validate(need(nrow(ad) > 0, "No extraction data."))
+    ggplot(ad, aes(x = period, y = N)) +
+      geom_col() +
+      labs(
+        title = sprintf("Samples per %s", switch(input$qc_agg, day = "day", month = "month", year = "year")),
+        x = "Period", y = "Samples"
+      ) +
+      theme_minimal()
+  })
+
+  output$qc_agg_volume_plot <- renderPlot({
+    ad <- qc_agg_data()
+    validate(need(nrow(ad) > 0, "No extraction data."))
+    ggplot(ad, aes(x = period, y = Median)) +
+      geom_line() +
+      geom_point() +
+      geom_ribbon(aes(ymin = P10, ymax = P90), alpha = 0.15) +
+      geom_hline(yintercept = 2, linetype = "dashed") +
+      labs(
+        title = sprintf("Median volume per %s (P10–P90)", switch(input$qc_agg, day = "day", month = "month", year = "year")),
+        x = "Period", y = "Volume (mL)"
+      ) +
+      theme_minimal()
+  })
+
+  output$qc_agg_tbl <- renderDT({
+    ad <- qc_agg_data()
+    datatable(ad, options = list(pageLength = 20, scrollX = TRUE))
+  })
+
+  output$qc_per_sample_tbl <- renderDT({
+    df <- extractions_filtered()
+    if (!nrow(df)) df <- tibble()
+    keep <- c("province", "zone", "numero", "code_barres_kps", "date_prelev", "date_rec_cpltha",
+              "date_env_cpltha", "date_env_inrb", "volume_ml", "volume_num", "file_date", "source_file", "flag")
+    datatable(df |>
+                select(any_of(keep)) |>
+                arrange(date_prelev, zone, numero),
+              options = list(pageLength = 20, scrollX = TRUE), filter = "top")
+  })
+
+  output$qc_out_tbl <- renderDT({
+    df <- extractions_filtered()
+    if (!nrow(df) || !"volume_num" %in% names(df)) {
+      df <- tibble()
+    } else {
+      rng <- input$qc_rng
+      df <- df |>
+        filter(!is.na(volume_num) & (volume_num < rng[1] | volume_num > rng[2])) |>
+        arrange(volume_num)
+    }
+    keep <- c("province", "zone", "numero", "code_barres_kps", "volume_ml", "volume_num", "date_prelev", "file_date", "source_file")
+    datatable(df |> select(any_of(keep)), options = list(pageLength = 20, scrollX = TRUE))
+  })
+
+  output$qc_dup_tbl <- renderDT({
+    flagged <- extractions_flagged()
+    flagged <- flagged$flagged
+    if (is.null(flagged) || !nrow(flagged) || !"flag" %in% names(flagged)) {
+      flagged <- tibble()
+    } else {
+      flagged <- flagged |> filter(flag != "OK")
+    }
+    keep <- c("flag", "province", "zone", "numero", "code_barres_kps", "volume_ml", "volume_num", "date_prelev", "file_date", "source_file")
+    datatable(flagged |> select(any_of(keep)), options = list(pageLength = 20, scrollX = TRUE))
+  })
+
+  output$qc_dl_zone <- downloadHandler(
+    filename = function() paste0("zone_summary_", Sys.Date(), ".csv"),
+    content = function(file) {
+      df <- extractions_filtered()
+      if (!nrow(df) || !all(c("province", "zone", "volume_num") %in% names(df))) {
+        readr::write_csv(tibble(), file)
+        return()
+      }
+      rng <- input$qc_rng
+      summ <- df |>
+        group_by(province, zone) |>
+        summarise(
+          N = dplyr::n(),
+          Out = sum(!is.na(volume_num) & (volume_num < rng[1] | volume_num > rng[2])),
+          `% Out` = round(100 * Out / pmax(N, 1), 1),
+          Median = round(stats::median(volume_num, na.rm = TRUE), 2),
+          P10 = round(stats::quantile(volume_num, 0.10, na.rm = TRUE, names = FALSE), 2),
+          P90 = round(stats::quantile(volume_num, 0.90, na.rm = TRUE, names = FALSE), 2),
+          .groups = "drop"
+        )
+      readr::write_csv(summ, file)
+    }
+  )
+
+  output$qc_dl_out <- downloadHandler(
+    filename = function() paste0("outliers_", Sys.Date(), ".csv"),
+    content = function(file) {
+      df <- extractions_filtered()
+      if (!nrow(df) || !"volume_num" %in% names(df)) {
+        readr::write_csv(tibble(), file)
+        return()
+      }
+      rng <- input$qc_rng
+      out <- df |>
+        filter(!is.na(volume_num) & (volume_num < rng[1] | volume_num > rng[2]))
+      readr::write_csv(out, file)
+    }
+  )
+
+  output$qc_dl_dup <- downloadHandler(
+    filename = function() paste0("duplicates_", Sys.Date(), ".csv"),
+    content = function(file) {
+      flagged <- extractions_flagged()
+      flagged <- flagged$flagged
+      if (is.null(flagged) || !nrow(flagged)) {
+        readr::write_csv(tibble(), file)
+        return()
+      }
+      readr::write_csv(flagged |> filter(flag != "OK"), file)
+    }
+  )
+
+  output$qc_dl_filt <- downloadHandler(
+    filename = function() paste0("filtered_extractions_", Sys.Date(), ".csv"),
+    content = function(file) {
+      df <- extractions_filtered()
+      if (!nrow(df)) df <- tibble()
+      readr::write_csv(df, file)
+    }
+  )
+
+  output$qc_dl_agg <- downloadHandler(
+    filename = function() paste0("extraction_timeseries_", input$qc_agg, "_", Sys.Date(), ".csv"),
+    content = function(file) {
+      readr::write_csv(qc_agg_data(), file)
+    }
+  )
   
   # === SUMMARY TABLES ===
   
