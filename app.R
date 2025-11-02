@@ -1282,7 +1282,10 @@ server <- function(input, output, session){
   }, once = TRUE)
 
   observeEvent(TRUE, {
-    paths <- tryCatch(readRDS(cache_file), error = function(e) NULL)
+    paths <- NULL
+    if (file.exists(cache_file)) {
+      paths <- tryCatch(readRDS(cache_file), error = function(e) NULL)
+    }
     if (is.list(paths)) {
       stored_paths(paths)
       if (!is.null(paths$root)) {
@@ -2148,7 +2151,11 @@ server <- function(input, output, session){
     s$zone_key <- dplyr::na_if(normalize_names(as.character(s$zone)), "")
     s$prov_key <- dplyr::na_if(normalize_names(as.character(s$province)), "")
 
+    geom_col <- attr(g, "sf_column")
     gj <- dplyr::left_join(g, s, by = c("zone_key", "prov_key"))
+    if (!inherits(gj, "sf") && !is.null(geom_col) && geom_col %in% names(gj) && inherits(gj[[geom_col]], "sfc")) {
+      gj <- sf::st_as_sf(gj, sf_column_name = geom_col, crs = sf::st_crs(g))
+    }
     gj$zone_uid <- dplyr::coalesce(gj$zone_uid, paste(gj$zone_key, gj$prov_key, sep = "__"))
     gj$layer_id <- gj$zone_uid
 
