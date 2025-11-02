@@ -48,6 +48,37 @@ parse_any_date <- function(x) {
   out
 }
 
+parse_decimal_number <- function(x) {
+  if (is.null(x)) return(numeric())
+  x_chr <- trimws(as.character(x))
+  x_chr[x_chr %in% c("", "NA", "N/A", "na", "NaN", "NULL")] <- NA
+
+  suppressWarnings({
+    parsed <- readr::parse_number(x_chr)
+  })
+
+  miss <- is.na(parsed) & !is.na(x_chr)
+  if (any(miss)) {
+    suppressWarnings({
+      parsed[miss] <- readr::parse_number(
+        x_chr[miss],
+        locale = readr::locale(decimal_mark = ",", grouping_mark = " ")
+      )
+    })
+  }
+
+  miss <- is.na(parsed) & !is.na(x_chr)
+  if (any(miss)) {
+    cleaned <- gsub("[^0-9,.-]", "", x_chr[miss])
+    cleaned <- gsub(",", ".", cleaned, fixed = TRUE)
+    suppressWarnings({
+      parsed[miss] <- as.numeric(cleaned)
+    })
+  }
+
+  parsed
+}
+
 read_biobank_file <- function(path) {
   if (!file.exists(path)) return(NULL)
   tryCatch({
@@ -106,7 +137,7 @@ clean_biobank_data <- function(df) {
         TRUE ~ NA_real_
       ),
 
-      doorlooptijd_num = suppressWarnings(as.numeric(doorlooptijd_raw)),
+      doorlooptijd_num = parse_decimal_number(doorlooptijd_raw),
       doorlooptijd_days = dplyr::case_when(
         !is.na(doorlooptijd_num) ~ doorlooptijd_num,
         !is.na(date_result) & !is.na(date_sample) ~ as.numeric(difftime(date_result, date_sample, units = "days")),
@@ -202,7 +233,7 @@ read_extractions_dir <- function(dir_extraction) {
       date_rec_cpltha = get_date("date_de_reception_cpltha_jj_mm_aaaa"),
       date_env_inrb = get_date("date_denvoi_inrb"),
       volume_raw = get_chr("volume_total_echantillon_sang_drs_ml"),
-      volume_ml = suppressWarnings(as.numeric(volume_raw)),
+      volume_ml = parse_decimal_number(volume_raw),
       volume_ml = ifelse(!is.na(volume_ml) & volume_ml > 10, volume_ml / 10, volume_ml)
     ) |>
     filter_non_empty_code_barres()
@@ -800,7 +831,7 @@ server <- function(input, output, session) {
     if (is.null(df) || !nrow(df)) return(tibble())
 
     df <- df |> mutate(
-      volume_num = suppressWarnings(as.numeric(volume_ml)),
+      volume_num = parse_decimal_number(volume_ml),
       file_date = as.Date(file_date)
     )
 
@@ -885,8 +916,14 @@ server <- function(input, output, session) {
   
   output$vb_sites <- renderText({
     df <- filtered_data(); req(df)
-    n_structures <- df |> filter(!is.na(structure)) |> n_distinct(structure)
-    n_units <- df |> filter(!is.na(unit)) |> n_distinct(unit)
+    if (!"structure" %in% names(df) || !"unit" %in% names(df)) {
+      return("0 structures, 0 units")
+    }
+
+    structures <- df |> dplyr::filter(!is.na(structure) & structure != "") |> dplyr::pull(structure)
+    units <- df |> dplyr::filter(!is.na(unit) & unit != "") |> dplyr::pull(unit)
+    n_structures <- dplyr::n_distinct(structures)
+    n_units <- dplyr::n_distinct(units)
     sprintf("%s structures, %s units", scales::comma(n_structures), scales::comma(n_units))
   })
 
