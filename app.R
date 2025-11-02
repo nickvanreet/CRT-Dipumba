@@ -192,13 +192,15 @@ read_extractions_dir <- function(dir_extraction) {
       volume_ml = suppressWarnings(as.numeric(volume_raw)),
       volume_ml = ifelse(!is.na(volume_ml) & volume_ml > 10, volume_ml / 10, volume_ml)
     ) |>
-    {
-      if ("code_barres_kps" %in% names(.)) {
-        dplyr::filter(., !(is.na(code_barres_kps) | code_barres_kps == ""))
-      } else {
-        .
+    (
+      function(df) {
+        if ("code_barres_kps" %in% names(df)) {
+          dplyr::filter(df, !(is.na(code_barres_kps) | code_barres_kps == ""))
+        } else {
+          df
+        }
       }
-    }
+    )
 }
 
 join_extractions_biobank <- function(extractions, biobank) {
