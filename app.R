@@ -445,32 +445,20 @@ flatten_grid3_cols <- function(x){
   x
 }
 
-read_uploaded_geo <- function(file_info){
-  if (is.null(file_info)) return(NULL)
-
-  ext <- tolower(tools::file_ext(file_info$name))
-  datapath <- file_info$datapath
-
-  if (!file.exists(datapath)) {
+read_geo_path <- function(path){
+  if (is.null(path) || !nzchar(path) || !file.exists(path)) {
     return(NULL)
   }
 
-  copy_with_ext <- function(path, extension){
-    tmp <- tempfile(fileext = paste0(".", extension))
-    file.copy(path, tmp, overwrite = TRUE)
-    tmp
-  }
-
+  ext <- tolower(tools::file_ext(path))
   sf_obj <- NULL
 
   if (ext == "rds") {
-    tmp <- copy_with_ext(datapath, ext)
-    sf_obj <- try(readRDS(tmp), silent = TRUE)
+    sf_obj <- try(readRDS(path), silent = TRUE)
   } else if (ext == "zip") {
-    tmp <- copy_with_ext(datapath, ext)
     unzip_dir <- tempfile("grid3_zip")
     dir.create(unzip_dir, showWarnings = FALSE, recursive = TRUE)
-    unzip_res <- try(utils::unzip(tmp, exdir = unzip_dir), silent = TRUE)
+    unzip_res <- try(utils::unzip(path, exdir = unzip_dir), silent = TRUE)
     if (inherits(unzip_res, "try-error")) {
       return(NULL)
     }
@@ -487,16 +475,14 @@ read_uploaded_geo <- function(file_info){
       sf_obj <- try(sf::st_read(target, quiet = TRUE, stringsAsFactors = FALSE), silent = TRUE)
     }
   } else if (ext %in% c("geojson", "json", "gpkg", "shp")) {
-    tmp <- copy_with_ext(datapath, ext)
-    sf_obj <- try(sf::read_sf(tmp, quiet = TRUE), silent = TRUE)
+    sf_obj <- try(sf::read_sf(path, quiet = TRUE), silent = TRUE)
     if (inherits(sf_obj, "try-error")) {
-      sf_obj <- try(sf::st_read(tmp, quiet = TRUE, stringsAsFactors = FALSE), silent = TRUE)
+      sf_obj <- try(sf::st_read(path, quiet = TRUE, stringsAsFactors = FALSE), silent = TRUE)
     }
   } else {
-    tmp <- datapath
-    sf_obj <- try(sf::read_sf(tmp, quiet = TRUE), silent = TRUE)
+    sf_obj <- try(sf::read_sf(path, quiet = TRUE), silent = TRUE)
     if (inherits(sf_obj, "try-error")) {
-      sf_obj <- try(sf::st_read(tmp, quiet = TRUE, stringsAsFactors = FALSE), silent = TRUE)
+      sf_obj <- try(sf::st_read(path, quiet = TRUE, stringsAsFactors = FALSE), silent = TRUE)
     }
   }
 
@@ -513,6 +499,50 @@ read_uploaded_geo <- function(file_info){
 
   sf_obj
 }
+
+read_uploaded_geo <- function(file_info){
+  if (is.null(file_info)) return(NULL)
+
+  datapath <- file_info$datapath
+  if (!file.exists(datapath)) {
+    return(NULL)
+  }
+
+  ext <- tolower(tools::file_ext(file_info$name))
+  copy_with_ext <- function(path, extension){
+    tmp <- tempfile(fileext = if (nzchar(extension)) paste0(".", extension) else "")
+    file.copy(path, tmp, overwrite = TRUE)
+    tmp
+  }
+
+  tmp_path <- copy_with_ext(datapath, ext)
+  read_geo_path(tmp_path)
+}
+
+read_default_health_zones_impl <- function(){
+  candidates <- unique(c(
+    Sys.getenv("GRID3_HEALTH_ZONES_FILE", unset = ""),
+    file.path("data", "health_zones_offline.geojson"),
+    file.path("data", "grid3_health_zones.geojson"),
+    file.path("data", "grid3_health_zones.gpkg"),
+    file.path("data", "grid3_health_zones.rds"),
+    file.path("www", "grid3_health_zones.geojson"),
+    file.path("www", "grid3_health_zones.gpkg"),
+    file.path("www", "grid3_health_zones.rds")
+  ))
+
+  for (candidate in candidates) {
+    sf_obj <- read_geo_path(candidate)
+    if (!is.null(sf_obj)) {
+      attr(sf_obj, "source_path") <- candidate
+      return(sf_obj)
+    }
+  }
+
+  NULL
+}
+
+read_default_health_zones <- memoise::memoise(read_default_health_zones_impl)
 
 # QC module -------------------------------------------------------------------
 qcUI <- function(id){
@@ -1238,6 +1268,18 @@ server <- function(input, output, session){
   cache_file <- file.path(cache_dir, "paths.rds")
   stored_paths <- reactiveVal(NULL)
   session$userData$bookmarking_active <- FALSE
+  default_zones_sf <- reactiveVal(NULL)
+  offline_notice_shown <- reactiveVal(FALSE)
+
+  observeEvent(TRUE, {
+    sf_obj <- read_default_health_zones()
+    if (!is.null(sf_obj)) {
+      default_zones_sf(list(
+        sf = sf_obj,
+        source = attr(sf_obj, "source_path")
+      ))
+    }
+  }, once = TRUE)
 
   observeEvent(TRUE, {
     paths <- tryCatch(readRDS(cache_file), error = function(e) NULL)
@@ -1741,7 +1783,18 @@ server <- function(input, output, session){
     if (isTRUE(input$use_grid3)) {
       helpText("GRID3-laag wordt via internet geladen wanneer nodig.")
     } else {
-      helpText("Upload een GeoJSON/Shapefile of vink GRID3 aan.")
+      offline <- default_zones_sf()
+      if (is.null(offline)) {
+        helpText("Upload een GeoJSON/Shapefile of vink GRID3 aan.")
+      } else {
+        file_label <- offline$source
+        if (!is.null(file_label) && nzchar(file_label)) {
+          file_label <- basename(file_label)
+        } else {
+          file_label <- "ingebedde kaartlaag"
+        }
+        helpText(glue::glue("Offline kaartlaag beschikbaar: {file_label}."))
+      }
     }
   })
 
@@ -1759,8 +1812,22 @@ server <- function(input, output, session){
     } else {
       sf <- read_uploaded_geo(input$zones_geo)
       if (is.null(sf)) {
-        showNotification("Kon kaartlaag niet lezen. Controleer het bestand.", type = "error")
-        return(NULL)
+        offline <- default_zones_sf()
+        if (is.null(offline)) {
+          showNotification("Geen offline kaartlaag gevonden. Upload een bestand of gebruik GRID3.", type = "error")
+          return(NULL)
+        }
+        sf <- offline$sf
+        if (!isTRUE(offline_notice_shown())) {
+          label <- offline$source
+          if (!is.null(label) && nzchar(label)) {
+            label <- basename(label)
+          } else {
+            label <- "ingebedde kaartlaag"
+          }
+          showNotification(glue::glue("Offline kaartlaag geladen: {label}."), type = "message")
+          offline_notice_shown(TRUE)
+        }
       }
       flatten_grid3_cols(sf)
     }
